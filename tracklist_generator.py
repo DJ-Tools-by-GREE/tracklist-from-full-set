@@ -103,6 +103,38 @@ SEGMENT_LENGTH_SECS      = 30.0   # length of each per-segment ratio probe
 SEGMENT_RATIO_HALF_WIDTH = 1.0    # ±% search around the global ratio per segment
 SEGMENT_RATIO_STEP       = 0.05   # % step inside each segment
 
+# ── Transition BPM sync ───────────────────────────────────────────────────────
+# When two tracks beatmatch through a transition, both decks play at the SAME
+# BPM by definition (the DJ has synced them).  After resolve_transitions has
+# fixed in/out timestamps, we re-fit the segments inside each transition
+# window with a SHARED ratio per pair of tracks — and we let it drift linearly
+# from the outgoing track's solo BPM at out_start to the incoming track's
+# solo BPM at in_end (since DJs commonly ride the pitch fader during the mix).
+#
+# This:
+#   • Removes spurious BPM noise that the per-track segment fitter produces
+#     during the overlap (where the chroma is a mix of two tracks).
+#   • Makes the played-curve cleaner through transitions (both refs are warped
+#     at the actual played BPM rather than each at its solo BPM).
+#   • Reveals the DJ's chosen transition BPM as a clean ramp on the plot.
+TRANSITION_BPM_SYNC_ENABLED = True
+SOLO_MARGIN_SECS  = 2.0    # ignore segments within this many sec of in_end /
+                           # out_start when picking each track's "solo" ratio
+                           # — those are still partly mixed.
+TRANSITION_RAMP_STEP_PCT  = 0.05   # step size for ramp-target probe
+TRANSITION_RAMP_HALF_PCT  = 1.5    # max ±% deviation of ramp endpoint from the
+                                   # straight-line interpolation between
+                                   # neighbour solo BPMs
+
+# ── Cue alignment ────────────────────────────────────────────────────────────
+# When comparing Engine DJ hotcue positions to detected transition markers,
+# a cue is considered "aligned" if it is within this many seconds of the marker.
+CUE_ALIGN_THRESHOLD_SECS = 3.0
+
+# ── Engine DJ sample rate ─────────────────────────────────────────────────────
+# Hotcue positions are stored in samples at this rate.
+ENGINE_SAMPLE_RATE = 44100
+
 # ── Hard-cut detection ────────────────────────────────────────────────────────
 # When the outgoing track has clearly stopped before the incoming one starts
 # (no overlap), we treat it as a hard cut: the in-transition / out-transition
@@ -189,6 +221,23 @@ class Track:
     is_hardcut_in:   bool = False
     is_hardcut_out:  bool = False
 
+    # Engine DJ hotcue positions (set-time seconds), None if not present.
+    # cue1 = in-transition start, cue3 = in-transition end,
+    # cue6 = out-transition start, cue8 = out-transition end.
+    cue1_secs: Optional[float] = None
+    cue3_secs: Optional[float] = None
+    cue6_secs: Optional[float] = None
+    cue8_secs: Optional[float] = None
+
+    # Position inside the SET (in chroma frames) where this track's locked
+    # alignment begins.  Needed by align_transition_bpms() to rewrite the
+    # played-curve and per-segment ratios inside transition windows after the
+    # initial per-track segment refinement has run.
+    lock_offset_frames: int = 0
+    # The original (pre-warp) reference chroma — kept around so transition
+    # re-fitting can probe new ratios without re-decoding the audio file.
+    ref_chroma_orig:    Optional[np.ndarray] = None
+
     # Per-segment ratio drift — captures slow speed changes within a track.
     # segment_centers_secs[i] is the set-time at the centre of segment i,
     # segment_ratios[i] is that segment's best playback ratio relative to the
@@ -215,6 +264,131 @@ def remap_path(path: str) -> str:
             rel = norm[len(legacy_norm):].lstrip("/")
             return os.path.normpath(os.path.join(current_norm, rel))
     return os.path.normpath(os.path.expanduser(norm))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Engine DJ hotcue reader
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _parse_hotcue_blob(blob: bytes) -> dict:
+    """Decompress and parse an Engine DJ PerformanceData.quickCues blob.
+
+    Returns {cue_number: position_secs} for cues with a valid (>=0) position.
+    Cue numbers are 1-indexed as stored in the binary data.
+    """
+    if not blob or len(blob) < 5:
+        return {}
+    try:
+        raw = zlib.decompress(blob[4:])
+    except zlib.error:
+        return {}
+
+    pos = 0
+    if len(raw) < 8:
+        return {}
+    n_cues = struct.unpack_from(">q", raw, pos)[0]
+    pos += 8
+
+    cues = {}
+    for cue_idx in range(n_cues):
+        if pos >= len(raw):
+            break
+        name_len = struct.unpack_from("B", raw, pos)[0]
+        pos += 1
+        if pos + name_len > len(raw):
+            break
+        pos += name_len   # skip name bytes
+        if pos + 12 > len(raw):
+            break
+        position_samples = struct.unpack_from(">d", raw, pos)[0]
+        pos += 8
+        pos += 4   # skip ARGB color
+        if position_samples >= 0:
+            cue_number = cue_idx + 1   # 1-indexed
+            cues[cue_number] = position_samples / ENGINE_SAMPLE_RATE
+    return cues
+
+
+def _track_id_for_path(db_path: str, file_path: str) -> Optional[int]:
+    """Look up the Engine DJ track ID for a given file path.
+
+    Tries the exact path first, then falls back to matching just the filename.
+    """
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        con = sqlite3.connect(db_path)
+        cur = con.cursor()
+        # Normalise separators for the comparison
+        norm = file_path.replace("\\", "/")
+        cur.execute("SELECT id FROM Track WHERE filename = ?", (norm,))
+        row = cur.fetchone()
+        if row:
+            con.close()
+            return int(row[0])
+        # Fall back: match by the last path component (filename only)
+        basename = os.path.basename(norm)
+        cur.execute("SELECT id FROM Track WHERE filename LIKE ?",
+                    (f"%/{basename}",))
+        row = cur.fetchone()
+        con.close()
+        return int(row[0]) if row else None
+    except Exception:
+        return None
+
+
+def _hotcues_for_track_id(db_path: str, track_id: int) -> dict:
+    """Query PerformanceData.quickCues for track_id and parse the blob."""
+    try:
+        con = sqlite3.connect(db_path)
+        cur = con.cursor()
+        cur.execute(
+            "SELECT quickCues FROM PerformanceData WHERE trackId = ?",
+            (track_id,)
+        )
+        row = cur.fetchone()
+        con.close()
+        if not row or row[0] is None:
+            return {}
+        return _parse_hotcue_blob(bytes(row[0]))
+    except Exception:
+        return {}
+
+
+def read_engine_hotcues(tracks: list, db_path: str) -> None:
+    """Populate cue1/cue3/cue6/cue8_secs on each Track from Engine DJ's DB.
+
+    The cue positions are stored in samples at ENGINE_SAMPLE_RATE; we convert
+    to seconds and store relative to the *track file* start (not set time).
+    The caller is responsible for converting to set-time by adding the track's
+    detected_start_secs offset when needed (done in write_tracklist /
+    write_review_ui).
+
+    Cue mapping:
+        cue1 → in-transition start
+        cue3 → in-transition end
+        cue6 → out-transition start
+        cue8 → out-transition end
+    """
+    if not os.path.isfile(db_path):
+        print(f"  Engine DB not found, skipping hotcues: {db_path}")
+        return
+
+    for t in tracks:
+        if t.is_mashup or t.is_missing:
+            continue
+        track_id = _track_id_for_path(db_path, t.file_path)
+        if track_id is None:
+            continue
+        cues = _hotcues_for_track_id(db_path, track_id)
+        if 1 in cues:
+            t.cue1_secs = cues[1]
+        if 3 in cues:
+            t.cue3_secs = cues[3]
+        if 6 in cues:
+            t.cue6_secs = cues[6]
+        if 8 in cues:
+            t.cue8_secs = cues[8]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -663,6 +837,267 @@ def resolve_transitions(tracks: list, frames_per_sec: float) -> None:
             nxt.is_hardcut_in  = False
 
 
+def _solo_ratio_at_boundary(
+    seg_centers_secs: np.ndarray,
+    seg_ratios:       np.ndarray,
+    boundary_secs:    float,
+    side:             str,                # "before" or "after"
+    margin_secs:      float = SOLO_MARGIN_SECS,
+) -> float:
+    """Return the segment ratio that best represents the track's *solo* BPM
+    just before / after a transition boundary.
+
+    side="before" — segments whose centre is at most `boundary_secs - margin`
+                    (i.e. before the track starts handing off).  Returns the
+                    LATEST such ratio.
+    side="after"  — segments whose centre is at least `boundary_secs + margin`
+                    (i.e. after the track has finished mixing in).  Returns
+                    the EARLIEST such ratio.
+
+    Falls back to the closest available segment ratio when nothing qualifies
+    (e.g. the track is too short to have a clean solo region).  Returns NaN
+    if there are no segments at all.
+    """
+    if seg_centers_secs is None or len(seg_centers_secs) == 0:
+        return float("nan")
+    if side == "before":
+        mask = seg_centers_secs <= (boundary_secs - margin_secs)
+        if mask.any():
+            return float(seg_ratios[mask][-1])
+        # Fall back to nearest segment
+        idx = int(np.argmin(np.abs(seg_centers_secs - boundary_secs)))
+        return float(seg_ratios[idx])
+    else:  # "after"
+        mask = seg_centers_secs >= (boundary_secs + margin_secs)
+        if mask.any():
+            return float(seg_ratios[mask][0])
+        idx = int(np.argmin(np.abs(seg_centers_secs - boundary_secs)))
+        return float(seg_ratios[idx])
+
+
+def _piecewise_warp_for_transition(*args, **kwargs):
+    """Deprecated; superseded by _build_ramp_warp.  Kept as a stub so any
+    earlier call sites raise loudly during development."""
+    raise NotImplementedError(
+        "_piecewise_warp_for_transition has been replaced by _build_ramp_warp"
+    )
+
+
+def align_transition_bpms(
+    tracks:         list,
+    set_chroma:     np.ndarray,
+    frames_per_sec: float,
+) -> None:
+    """Enforce same-BPM-for-both-tracks across each (non-hardcut) transition.
+
+    Physics: when two tracks beatmatch through a transition, both decks are
+    locked at the SAME tempo by definition (sync button or pitch-matched).
+    But the per-track segment fitter (refine_tempo_per_segment) sees the two
+    tracks' chromas SUPERIMPOSED inside the overlap window, so its segment
+    ratios there are corrupted by the other track.
+
+    This pass corrects that:
+      1. Read each track's "solo" boundary ratios:
+         • r_cur_out  = cur's segment ratio just BEFORE out_start
+                        (the BPM cur was playing at when the mix began)
+         • r_nxt_in   = nxt's segment ratio just AFTER in_end
+                        (the BPM nxt settled into after the mix)
+      2. Choose a single ramp (r_cur_ramp_end → r_nxt_ramp_start) that BOTH
+         tracks must follow inside the transition window.  Default endpoints
+         are r_cur_out and r_nxt_in (a linear bridge).  The endpoints are
+         then jointly optimised within ±TRANSITION_RAMP_HALF_PCT to maximise
+         the SUM of cur+nxt similarity inside the overlap window.
+      3. Replace the segment ratios of cur (inside out_start..out_end) and
+         nxt (inside in_start..in_end) with samples from that shared ramp.
+      4. Rebuild each track's warped ref chroma in the transition region
+         using the shared ramp, then recompute their played_curves so the
+         heatmap reflects the corrected warp.
+
+    Hard cuts are skipped — there's no shared BPM there.  Mashup / missing
+    tracks were already filtered out before this runs.
+    """
+    if not TRANSITION_BPM_SYNC_ENABLED:
+        return
+
+    detectable = [t for t in tracks
+                  if not t.is_mashup and not t.is_missing
+                  and t.played_curve is not None
+                  and t.segment_ratios is not None
+                  and t.ref_chroma_orig is not None]
+
+    candidate_pcts = np.arange(
+        -TRANSITION_RAMP_HALF_PCT,
+        TRANSITION_RAMP_HALF_PCT + TRANSITION_RAMP_STEP_PCT / 2,
+        TRANSITION_RAMP_STEP_PCT,
+    )
+
+    for i in range(len(detectable) - 1):
+        cur = detectable[i]
+        nxt = detectable[i + 1]
+        if cur.is_hardcut_out or nxt.is_hardcut_in:
+            continue
+        if cur.out_start_secs is None or cur.out_end_secs is None:
+            continue
+        if cur.out_end_secs - cur.out_start_secs < 0.5:
+            # Window too short — not enough audio for a meaningful re-fit
+            continue
+
+        # Boundary solo ratios (defaults for the ramp endpoints)
+        r_cur_solo = _solo_ratio_at_boundary(
+            cur.segment_centers_secs, cur.segment_ratios,
+            cur.out_start_secs, "before")
+        r_nxt_solo = _solo_ratio_at_boundary(
+            nxt.segment_centers_secs, nxt.segment_ratios,
+            nxt.in_end_secs, "after")
+        if not (np.isfinite(r_cur_solo) and np.isfinite(r_nxt_solo)):
+            continue
+
+        t_start_f = int(round(cur.out_start_secs * frames_per_sec))
+        t_end_f   = int(round(cur.out_end_secs   * frames_per_sec))
+        if t_end_f - t_start_f < 4:
+            continue
+        n_set = set_chroma.shape[1]
+        t_start_f = max(0, t_start_f)
+        t_end_f   = min(n_set, t_end_f)
+        set_overlap = set_chroma[:, t_start_f:t_end_f]
+        n_overlap = set_overlap.shape[1]
+
+        # ── Joint ramp probe ─────────────────────────────────────────────
+        # The ramp's ENDPOINTS are searched in a small box around the
+        # neighbour solo ratios.  This lets the BPM drift inside the
+        # transition (DJ rides the fader) be discovered, but constrains
+        # the result to be physically plausible.
+        #
+        # For each (ra, rb) candidate we synthesise the chroma each track
+        # would produce inside the transition window if it were warped at
+        # that ramp, and score the SUM of (set·cur_warped) + (set·nxt_warped)
+        # — both decks contribute to the audio inside the overlap, so the
+        # joint score is the right thing to maximise.
+        cur_orig_anchor = max(0, int(round(
+            (t_start_f - cur.lock_offset_frames) * r_cur_solo
+        )))
+        cur_orig_anchor = min(cur_orig_anchor, cur.ref_chroma_orig.shape[1] - 4)
+        nxt_orig_anchor = max(0, int(round(
+            (t_start_f - nxt.lock_offset_frames) * r_nxt_solo
+        )))
+        nxt_orig_anchor = min(nxt_orig_anchor, nxt.ref_chroma_orig.shape[1] - 4)
+
+        best_score = -np.inf
+        best_endpoints = (r_cur_solo, r_nxt_solo)
+
+        for pct_a in candidate_pcts:
+            for pct_b in candidate_pcts:
+                ra = r_cur_solo + pct_a / 100.0
+                rb = r_nxt_solo + pct_b / 100.0
+
+                cur_warped = _build_ramp_warp(
+                    cur.ref_chroma_orig, n_overlap,
+                    cur_orig_anchor, ra, rb, frames_per_sec,
+                )
+                nxt_warped = _build_ramp_warp(
+                    nxt.ref_chroma_orig, n_overlap,
+                    nxt_orig_anchor, ra, rb, frames_per_sec,
+                )
+
+                score_cur = float(np.einsum(
+                    "ij,ij->", set_overlap, cur_warped[:, :n_overlap]
+                )) / n_overlap
+                score_nxt = float(np.einsum(
+                    "ij,ij->", set_overlap, nxt_warped[:, :n_overlap]
+                )) / n_overlap
+                score = score_cur + score_nxt
+                if score > best_score:
+                    best_score = score
+                    best_endpoints = (ra, rb)
+
+        # ── Apply the winning ramp to BOTH tracks ────────────────────────
+        ra, rb = best_endpoints
+
+        # Rewrite segment ratios that fall inside the transition with the
+        # ramp values, so the CSV / heatmap reflect the corrected BPM.
+        for trk, t0, t1 in [
+            (cur, cur.out_start_secs, cur.out_end_secs),
+            (nxt, nxt.in_start_secs,  nxt.in_end_secs),
+        ]:
+            if trk.segment_centers_secs is None:
+                continue
+            mask = ((trk.segment_centers_secs >= t0) &
+                    (trk.segment_centers_secs <= t1))
+            if mask.any():
+                centers = trk.segment_centers_secs[mask]
+                rel = (centers - t0) / max(1e-6, t1 - t0)
+                trk.segment_ratios[mask] = ra + (rb - ra) * rel
+            else:
+                # No segment centre inside the window — append synthetic ones
+                # so the CSV / plot have something to show.
+                center = (t0 + t1) / 2
+                rel = 0.5
+                value = ra + (rb - ra) * rel
+                trk.segment_centers_secs = np.append(trk.segment_centers_secs, center)
+                trk.segment_ratios       = np.append(trk.segment_ratios, value)
+                order = np.argsort(trk.segment_centers_secs)
+                trk.segment_centers_secs = trk.segment_centers_secs[order]
+                trk.segment_ratios       = trk.segment_ratios[order]
+
+        # Rebuild each track's played_curve over [t_start_f, t_end_f] using
+        # the shared ramp so the heatmap and review UI show clean alignment.
+        for trk, neighbour_solo in [(cur, r_cur_solo), (nxt, r_nxt_solo)]:
+            ref_orig = trk.ref_chroma_orig
+            n_orig   = ref_orig.shape[1]
+            ref_start_in_warped = t_start_f - trk.lock_offset_frames
+            if ref_start_in_warped < 0 or ref_start_in_warped >= len(trk.played_curve):
+                continue
+            cur_orig_pos = int(round(ref_start_in_warped * neighbour_solo))
+            cur_orig_pos = max(0, min(cur_orig_pos, n_orig - 4))
+            warped_seg = _build_ramp_warp(
+                ref_orig, n_overlap, cur_orig_pos, ra, rb, frames_per_sec,
+            )
+            # Recompute per-frame similarity for the transition slice.
+            sims = np.einsum(
+                "ij,ij->j", set_overlap, warped_seg[:, :n_overlap]
+            ).astype(np.float32)
+            # Splice into the played_curve at the transition's set-time range.
+            trk.played_curve[t_start_f:t_start_f + len(sims)] = sims
+
+
+def _build_ramp_warp(
+    ref_orig:        np.ndarray,
+    n_out:           int,
+    orig_anchor:     int,
+    r_start:         float,
+    r_end:           float,
+    frames_per_sec:  float,
+) -> np.ndarray:
+    """Produce a (12 × n_out) chroma slice by walking ref_orig from
+    orig_anchor with a linearly varying ratio r_start → r_end.
+
+    Used by align_transition_bpms() to score and apply ramp warps without
+    going through the full piecewise-warp helper.  Each ~1-second sub-step
+    uses a fixed local ratio (linear interp at sub-step centre).
+    """
+    out = np.zeros((12, n_out), dtype=np.float32)
+    n_orig = ref_orig.shape[1]
+    sub_n = max(4, int(round(1.0 * frames_per_sec)))
+    cur_out  = 0
+    cur_orig = orig_anchor
+    while cur_out < n_out and cur_orig < n_orig - 2:
+        this_n = min(sub_n, n_out - cur_out)
+        rel = (cur_out + this_n / 2) / max(1, n_out)
+        local_r = r_start + (r_end - r_start) * rel
+        orig_slice_n = max(2, int(round(this_n * local_r)))
+        orig_slice = ref_orig[:, cur_orig:min(cur_orig + orig_slice_n, n_orig)]
+        if orig_slice.shape[1] < 2:
+            break
+        w = warp_chroma(orig_slice, local_r)
+        n_write = min(this_n, w.shape[1])
+        if n_write <= 0:
+            break
+        out[:, cur_out:cur_out + n_write] = w[:, :n_write]
+        cur_out  += n_write
+        cur_orig += orig_slice_n
+    return out
+
+
 def build_tempo_ratios(
     max_pct:    float,
     step_pct:   float = TEMPO_STEP_PCT,
@@ -892,6 +1327,12 @@ def _hms_ticks(x0: float, x1: float, n_ticks: int = 8) -> tuple:
     return vals, labels
 
 
+def set_to_file_time(set_time: float, track) -> float:
+    """Convert a set-time (seconds) to the position in the original track file."""
+    lock_secs = track.lock_offset_frames / (ANALYSIS_SR / HOP_LENGTH)
+    return (set_time - lock_secs) * track.tempo_ratio
+
+
 def write_tracklist(tracks: list, out_path: str):
     """Write the tracklist as a CSV.
 
@@ -902,6 +1343,8 @@ def write_tracklist(tracks: list, out_path: str):
         in_start, in_end       — incoming transition window (set time)
         out_start, out_end     — outgoing transition window (set time)
         in_start_hms, in_end_hms, out_start_hms, out_end_hms — same, formatted
+        in_start_file, in_end_file, out_start_file, out_end_file — file time (secs)
+        in_start_file_hms, …   — same, formatted
         confidence             — locked-region mean similarity
         bpm_shift_pct          — global playback-speed shift (%, vs original)
         bpm_shift_min_pct      — slowest segment within the track
@@ -911,17 +1354,21 @@ def write_tracklist(tracks: list, out_path: str):
         played_bpm_mean        — original_bpm × mean_segment_ratio (empty if BPM=0)
 
     All timestamps are set-time seconds (decimals, ms precision).
+    File-time timestamps are seconds into the original track file (tempo-corrected).
     Mashup and missing tracks have empty timestamp cells.
     """
     fieldnames = [
         "#", "title", "artist", "status",
         "in_start", "in_end", "out_start", "out_end",
         "in_start_hms", "in_end_hms", "out_start_hms", "out_end_hms",
+        "in_start_file", "in_end_file", "out_start_file", "out_end_file",
+        "in_start_file_hms", "in_end_file_hms", "out_start_file_hms", "out_end_file_hms",
         "hardcut_in", "hardcut_out",
         "confidence",
         "bpm_shift_pct", "bpm_shift_min_pct", "bpm_shift_max_pct",
         "bpm_shift_stdev_pct",
         "original_bpm", "played_bpm_mean",
+        "cue1_set_secs", "cue3_set_secs", "cue6_set_secs", "cue8_set_secs",
     ]
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -957,6 +1404,20 @@ def write_tracklist(tracks: list, out_path: str):
                     f"{t.bpm * mean_ratio:.2f}" if t.bpm > 0 else ""
                 )
 
+                # Convert track-relative cue positions to set time.
+                # Cue seconds are in original-speed track time; dividing by
+                # tempo_ratio converts to played duration, then add track start.
+                def _cue_set_secs(cue_track_secs):
+                    if cue_track_secs is None or t.detected_start_secs is None:
+                        return ""
+                    ratio = mean_ratio if mean_ratio else 1.0
+                    return f"{t.detected_start_secs + cue_track_secs / ratio:.3f}"
+
+                in_start_f  = set_to_file_time(t.in_start_secs,  t) if t.in_start_secs  is not None else None
+                in_end_f    = set_to_file_time(t.in_end_secs,    t) if t.in_end_secs    is not None else None
+                out_start_f = set_to_file_time(t.out_start_secs, t) if t.out_start_secs is not None else None
+                out_end_f   = set_to_file_time(t.out_end_secs,   t) if t.out_end_secs   is not None else None
+
                 row.update({
                     "in_start":         f"{t.in_start_secs:.3f}"  if t.in_start_secs  is not None else "",
                     "in_end":           f"{t.in_end_secs:.3f}"    if t.in_end_secs    is not None else "",
@@ -966,6 +1427,14 @@ def write_tracklist(tracks: list, out_path: str):
                     "in_end_hms":       fmt_time(t.in_end_secs),
                     "out_start_hms":    fmt_time(t.out_start_secs),
                     "out_end_hms":      fmt_time(t.out_end_secs),
+                    "in_start_file":    f"{in_start_f:.3f}"  if in_start_f  is not None else "",
+                    "in_end_file":      f"{in_end_f:.3f}"    if in_end_f    is not None else "",
+                    "out_start_file":   f"{out_start_f:.3f}" if out_start_f is not None else "",
+                    "out_end_file":     f"{out_end_f:.3f}"   if out_end_f   is not None else "",
+                    "in_start_file_hms":  fmt_time(in_start_f)  if in_start_f  is not None else "",
+                    "in_end_file_hms":    fmt_time(in_end_f)    if in_end_f    is not None else "",
+                    "out_start_file_hms": fmt_time(out_start_f) if out_start_f is not None else "",
+                    "out_end_file_hms":   fmt_time(out_end_f)   if out_end_f   is not None else "",
                     "hardcut_in":       "1" if t.is_hardcut_in  else "",
                     "hardcut_out":      "1" if t.is_hardcut_out else "",
                     "confidence":       f"{t.confidence:.3f}",
@@ -975,6 +1444,10 @@ def write_tracklist(tracks: list, out_path: str):
                     "bpm_shift_stdev_pct": seg_std,
                     "original_bpm":     f"{t.bpm:.2f}" if t.bpm > 0 else "",
                     "played_bpm_mean":  played_bpm_mean,
+                    "cue1_set_secs":    _cue_set_secs(t.cue1_secs),
+                    "cue3_set_secs":    _cue_set_secs(t.cue3_secs),
+                    "cue6_set_secs":    _cue_set_secs(t.cue6_secs),
+                    "cue8_set_secs":    _cue_set_secs(t.cue8_secs),
                 })
             else:
                 for k in fieldnames[4:]:
@@ -1071,11 +1544,6 @@ def write_heatmap(tracks: list, set_duration: float, out_path: str):
                     markersize=7, zorder=5,
                     markeredgecolor="black", markeredgewidth=0.4)
 
-        ring_color = "lime" if t.confidence >= MIN_CONFIDENCE else "red"
-        ax.plot(t.detected_start_secs, i, marker="o",
-                markerfacecolor="none", markeredgecolor=ring_color,
-                markeredgewidth=1.4, markersize=10, zorder=6)
-
     tick_vals, tick_labels = _hms_ticks(0, set_duration, n_ticks=24)
     ax.set_xticks(tick_vals)
     ax.set_xticklabels(tick_labels)
@@ -1084,8 +1552,7 @@ def write_heatmap(tracks: list, set_duration: float, out_path: str):
     ax.set_xlabel("Set time (h:mm:ss)" if set_duration >= 3600 else "Set time (m:ss)")
     ax.set_title(
         "Per-track playback heatmap — "
-        "▶ green/orange = in-transition window, ◀ orange/red = out-transition window, "
-        "◯ green/red = global lock confidence"
+        "▶ green/orange = in-transition window, ◀ orange/red = out-transition window"
     )
     ax.grid(axis="x", color="white", alpha=0.15, linewidth=0.4)
     fig.tight_layout()
@@ -1343,6 +1810,14 @@ def write_review_ui(tracks: list, set_duration: float, out_path: str):
             seg_y = ((t.segment_ratios - 1.0) * 100.0).tolist()
         else:
             seg_x, seg_y = [], []
+        # Convert track-relative cue positions to set time
+        mean_ratio = (float(t.segment_ratios.mean())
+                      if t.segment_ratios is not None and len(t.segment_ratios)
+                      else t.tempo_ratio) or 1.0
+        def _to_set(cue):
+            if cue is None or t.detected_start_secs is None:
+                return None
+            return t.detected_start_secs + cue / mean_ratio
         curves[str(t.number)] = {
             "x":          x_ds,
             "y":          y_ds,
@@ -1358,6 +1833,10 @@ def write_review_ui(tracks: list, set_duration: float, out_path: str):
             "confidence": float(t.confidence),
             "title":      t.title,
             "artist":     t.artist,
+            "cue1":       _to_set(t.cue1_secs),
+            "cue3":       _to_set(t.cue3_secs),
+            "cue6":       _to_set(t.cue6_secs),
+            "cue8":       _to_set(t.cue8_secs),
         }
 
     # Table rows — same fields the CSV gets, plus a clickable status badge.
@@ -1374,8 +1853,27 @@ def write_review_ui(tracks: list, set_duration: float, out_path: str):
 
         if status in ("ok", "low_confidence"):
             seg_std = ""
+            mean_ratio = t.tempo_ratio
             if t.segment_ratios is not None and len(t.segment_ratios):
                 seg_std = f"{((t.segment_ratios - 1.0) * 100).std():.2f}"
+                mean_ratio = float(t.segment_ratios.mean())
+            mean_ratio = mean_ratio or 1.0
+
+            def _to_set_r(cue):
+                if cue is None or t.detected_start_secs is None:
+                    return None
+                return t.detected_start_secs + cue / mean_ratio
+
+            cue1_set = _to_set_r(t.cue1_secs)
+            cue3_set = _to_set_r(t.cue3_secs)
+            cue6_set = _to_set_r(t.cue6_secs)
+            cue8_set = _to_set_r(t.cue8_secs)
+
+            def _aligned(cue_set, marker_secs):
+                if cue_set is None or marker_secs is None:
+                    return None
+                return abs(cue_set - marker_secs) <= CUE_ALIGN_THRESHOLD_SECS
+
             rows.append({
                 "num":           t.number,
                 "title":         t.title,
@@ -1390,6 +1888,14 @@ def write_review_ui(tracks: list, set_duration: float, out_path: str):
                 "bpm_shift":     f"{(t.tempo_ratio - 1.0) * 100:+.2f}",
                 "bpm_stdev":     seg_std,
                 "selectable":    True,
+                "cue1_hms":  fmt_time(cue1_set) if cue1_set is not None else "",
+                "cue3_hms":  fmt_time(cue3_set) if cue3_set is not None else "",
+                "cue6_hms":  fmt_time(cue6_set) if cue6_set is not None else "",
+                "cue8_hms":  fmt_time(cue8_set) if cue8_set is not None else "",
+                "cue1_ok":   _aligned(cue1_set, t.in_start_secs),
+                "cue3_ok":   _aligned(cue3_set, t.in_end_secs),
+                "cue6_ok":   _aligned(cue6_set, t.out_start_secs),
+                "cue8_ok":   _aligned(cue8_set, t.out_end_secs),
             })
         else:
             rows.append({
@@ -1417,6 +1923,7 @@ def write_review_ui(tracks: list, set_duration: float, out_path: str):
         "played_threshold": PLAYED_THRESHOLD,
         "onset_threshold":  ONSET_THRESHOLD,
         "transition_window_secs": TRANSITION_WINDOW_SECS,
+        "cue_align_threshold_secs": CUE_ALIGN_THRESHOLD_SECS,
         "rows":             rows,
         "curves":           curves,
         "detectable_nums":  detectable_nums,
@@ -1436,7 +1943,7 @@ def write_review_ui(tracks: list, set_duration: float, out_path: str):
   }
   body { margin:0; padding:0; background:var(--bg); color:var(--text);
          font:13px/1.4 -apple-system, BlinkMacSystemFont, sans-serif; }
-  #app { display:grid; grid-template-columns: 580px 1fr; height:100vh; }
+  #app { display:grid; grid-template-columns: 820px 1fr; height:100vh; }
   #left { border-right:1px solid var(--border); overflow:hidden;
           display:flex; flex-direction:column; }
   #search { padding:10px; border-bottom:1px solid var(--border);
@@ -1463,6 +1970,7 @@ def write_review_ui(tracks: list, set_duration: float, out_path: str):
               text-overflow:ellipsis; white-space:nowrap; }
   td.mono { font-family:ui-monospace, monospace; font-size:12px;
             color:#bbb; }
+  td.cue-bad { background:rgba(248,113,113,0.28) !important; color:#f87171; }
   .badge { display:inline-block; padding:1px 6px; border-radius:3px;
            font-size:10px; text-transform:uppercase; font-weight:600; }
   .badge.ok      { background:rgba(74, 222, 128, 0.18); color:var(--ok); }
@@ -1503,6 +2011,10 @@ def write_review_ui(tracks: list, set_duration: float, out_path: str):
           <th data-sort="confidence">conf</th>
           <th data-sort="bpm_shift">bpm%</th>
           <th data-sort="bpm_stdev">σ%</th>
+          <th data-sort="cue1_hms" title="Engine DJ cue1 vs in_start">cue1</th>
+          <th data-sort="cue3_hms" title="Engine DJ cue3 vs in_end">cue3</th>
+          <th data-sort="cue6_hms" title="Engine DJ cue6 vs out_start">cue6</th>
+          <th data-sort="cue8_hms" title="Engine DJ cue8 vs out_end">cue8</th>
         </tr></thead>
         <tbody id="tbody"></tbody>
       </table>
@@ -1589,6 +2101,10 @@ function renderTable() {
       <td class="mono">${r.confidence}</td>
       <td class="mono">${r.bpm_shift}</td>
       <td class="mono">${r.bpm_stdev}</td>
+      <td class="mono${r.cue1_ok === false ? ' cue-bad' : ''}" title="cue1 vs in_start">${r.cue1_hms || '—'}</td>
+      <td class="mono${r.cue3_ok === false ? ' cue-bad' : ''}" title="cue3 vs in_end">${r.cue3_hms || '—'}</td>
+      <td class="mono${r.cue6_ok === false ? ' cue-bad' : ''}" title="cue6 vs out_start">${r.cue6_hms || '—'}</td>
+      <td class="mono${r.cue8_ok === false ? ' cue-bad' : ''}" title="cue8 vs out_end">${r.cue8_hms || '—'}</td>
     </tr>`).join('');
 
   document.querySelectorAll('tbody tr.selectable').forEach(tr => {
@@ -1682,14 +2198,20 @@ function buildChart(divId, label, curveData, windowCenter, windowSecs, role) {
       line: { color: m.color, width: 1.5, dash: 'dash' },
     });
   });
-  // Lock-confidence ring (thin solid line)
-  if (curveData.lock != null && curveData.lock >= x0 && curveData.lock <= x1) {
-    const lockColor = curveData.confidence >= DATA.min_confidence ? '#4ade80' : '#f87171';
+  // Engine DJ hotcue lines (dotted, thinner, white/cyan)
+  const cueSpecs = [
+    { val: curveData.cue1, label: 'cue1 (in_start)' },
+    { val: curveData.cue3, label: 'cue3 (in_end)' },
+    { val: curveData.cue6, label: 'cue6 (out_start)' },
+    { val: curveData.cue8, label: 'cue8 (out_end)' },
+  ];
+  cueSpecs.forEach(c => {
+    if (c.val == null || c.val < x0 || c.val > x1) return;
     shapes.push({
-      type: 'line', x0: curveData.lock, x1: curveData.lock, y0: 0, y1: 1, yref: 'y',
-      line: { color: lockColor, width: 1, dash: 'solid' },
+      type: 'line', x0: c.val, x1: c.val, y0: 0, y1: 1, yref: 'y',
+      line: { color: '#38bdf8', width: 1, dash: 'dot' },
     });
-  }
+  });
   // Threshold lines
   shapes.push({
     type: 'line', x0: x0, x1: x1, y0: DATA.played_threshold, y1: DATA.played_threshold,
@@ -1917,6 +2439,8 @@ def main():
         t.score_offsets_secs  = best["score_offsets"] / frames_per_sec
         t.played_curve        = played_curve
         t.played_times_secs   = np.arange(len(played_curve)) / frames_per_sec
+        t.lock_offset_frames  = int(best["offset"])
+        t.ref_chroma_orig     = ref_chroma_orig
 
         bpm_shift = (best["ratio"] - 1.0) * 100
         flag      = "✓" if t.confidence >= MIN_CONFIDENCE else "?"
@@ -1938,8 +2462,18 @@ def main():
     print("\nResolving transition windows …")
     resolve_transitions(tracks, frames_per_sec)
 
+    # ── Align BPMs across each transition ───────────────────────────────────
+    if TRANSITION_BPM_SYNC_ENABLED:
+        print("Aligning transition BPMs (shared ramp per pair) …")
+        align_transition_bpms(tracks, set_chroma, frames_per_sec)
+    # Free the per-track original chroma — heatmap / CSV / UI don't need it.
+    for t in tracks:
+        t.ref_chroma_orig = None
+
     # ── Outputs ─────────────────────────────────────────────────────────────
     print("\nWriting outputs …")
+    print("Reading Engine DJ hotcues …")
+    read_engine_hotcues(tracks, ENGINE_DB_PATH)
     write_tracklist(tracks, OUTPUT_TRACKLIST)
     write_heatmap(tracks, set_duration, OUTPUT_HEATMAP)
     write_interactive_transitions(tracks, set_duration, OUTPUT_INTERACTIVE)
