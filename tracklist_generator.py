@@ -103,6 +103,18 @@ SEGMENT_LENGTH_SECS      = 30.0   # length of each per-segment ratio probe
 SEGMENT_RATIO_HALF_WIDTH = 1.0    # ±% search around the global ratio per segment
 SEGMENT_RATIO_STEP       = 0.05   # % step inside each segment
 
+# ── Hard-cut detection ────────────────────────────────────────────────────────
+# When the outgoing track has clearly stopped before the incoming one starts
+# (no overlap), we treat it as a hard cut: the in-transition / out-transition
+# windows collapse to a single instant.  Both endpoints get the same value so
+# the heatmap and CSV show a single marker per cut, not a near-zero range that
+# looks like a measurement artefact.
+HARDCUT_GAP_SECS = 0.30   # gap between cur-fade-out and nxt-fade-in below
+                          # which the transition is treated as overlapping
+HARDCUT_OVERLAP_SECS = 0.30   # overlap above which the transition is a real
+                              # mix (anything between these two thresholds is
+                              # ambiguous → still treated as a hard cut)
+
 # ── Detection settings ────────────────────────────────────────────────────────
 ANALYSIS_SR        = 22050     # downsample target for analysis
 HOP_LENGTH         = 1024      # ~46 ms hop (chroma frame rate ≈ 21.5 Hz)
@@ -169,6 +181,13 @@ class Track:
     in_end_secs:     Optional[float] = None
     out_start_secs:  Optional[float] = None
     out_end_secs:    Optional[float] = None
+
+    # Hard-cut flags — True when the in/out transition is essentially a clean
+    # cut (no overlap between songs) rather than a real mix.  In that case
+    # in_start == in_end (or out_start == out_end) and the UI/CSV should show
+    # a single marker for the cut, not a zero-width range.
+    is_hardcut_in:   bool = False
+    is_hardcut_out:  bool = False
 
     # Per-segment ratio drift — captures slow speed changes within a track.
     # segment_centers_secs[i] is the set-time at the centre of segment i,
@@ -520,38 +539,55 @@ def detect_played_region(
 def resolve_transitions(tracks: list, frames_per_sec: float) -> None:
     """Compute the four transition timestamps for every track.
 
-    For each consecutive pair (N, N+1) we walk both played-curves between
-    track N's coarse-detected end and track N+1's coarse-detected start, and
-    locate the moment N+1 first becomes audible above ONSET_THRESHOLD
-    (= mix_in) and the moment N falls below ONSET_THRESHOLD (= mix_out).
+    Joint detection — each transition (N → N+1) produces two anchor times that
+    are SHARED between both tracks by construction:
 
-    The resulting timestamps:
-        track N+1.in_start  = track N+1.out_start (of N→N+1 transition) = mix_in
-        track N+1.in_end    = track N.out_end                            = mix_out
-    so the transition window is [mix_in, mix_out] from both perspectives.
+        T_overlap_start  =  cur.out_start  =  nxt.in_start
+        T_overlap_end    =  cur.out_end    =  nxt.in_end
 
-    Mashup tracks are skipped entirely (they don't advance the timeline).
+    so the in-transition of track N+1 occupies the same set-time interval as
+    the out-transition of track N.  This makes adjacent rows in the heatmap
+    line up cleanly: one marker per shared edge, not two near-equal ones.
+
+    The two anchors are found by analysing both played-curves over the same
+    overlap window:
+
+      • T_overlap_start  =  the latest of (last_cur_below_onset_before_overlap,
+                                            first_nxt_above_onset_in_overlap)
+                            — i.e. the moment BOTH tracks are audible.
+
+      • T_overlap_end    =  the earliest of (last_cur_above_onset,
+                                              first_nxt_above_played_threshold_solo)
+                            — i.e. the moment the outgoing track has cleared
+                              and the incoming one is the lead.
+
+    HARD CUTS — when the outgoing fade-out and incoming fade-in barely overlap
+    (gap larger than HARDCUT_GAP_SECS, or overlap shorter than
+    HARDCUT_OVERLAP_SECS), it's a clean cut: both anchors collapse to a single
+    boundary instant (the midpoint of cur_silenced and nxt_audible).  The
+    track is flagged is_hardcut_out / is_hardcut_in so the UI shows one marker
+    instead of two near-identical ones.
+
+    Mashup tracks are skipped (they don't advance the timeline).
     """
     detectable = [t for t in tracks
                   if not t.is_mashup and not t.is_missing
                   and t.played_curve is not None]
 
-    for i, t in enumerate(detectable):
-        # Default: use the detected audible region itself
+    # Defaults — used for the very first track's in_* and very last out_*.
+    for t in detectable:
         t.in_start_secs  = t.detected_start_secs
-        t.in_end_secs    = t.detected_start_secs   # placeholder, refined below
-        t.out_start_secs = t.detected_end_secs     # placeholder
+        t.in_end_secs    = t.detected_start_secs
+        t.out_start_secs = t.detected_end_secs
         t.out_end_secs   = t.detected_end_secs
+
+    BUFFER_SECS = 30.0
 
     for i in range(len(detectable) - 1):
         cur = detectable[i]
         nxt = detectable[i + 1]
 
-        # Search window for the transition: from 30 s before the next track's
-        # coarse start to a few seconds after the current track's coarse end.
-        # This bounds the overlap region tightly so brief incidental chord
-        # similarities elsewhere in the set can't be picked up as false starts.
-        BUFFER_SECS = 30.0
+        # Search window: the overlap zone, padded.
         win_start = max(cur.detected_start_secs,
                         nxt.detected_start_secs - BUFFER_SECS)
         win_end   = min(nxt.detected_end_secs,
@@ -566,39 +602,65 @@ def resolve_transitions(tracks: list, frames_per_sec: float) -> None:
         cur_fine = _smooth(cur.played_curve, int(FINE_SMOOTH_SECS * frames_per_sec))
         nxt_fine = _smooth(nxt.played_curve, int(FINE_SMOOTH_SECS * frames_per_sec))
 
-        # mix_in: first frame in the window where the NEXT track rises above
-        # ONSET_THRESHOLD.
-        nxt_window = nxt_fine[s0:s1]
-        above_nxt  = np.where(nxt_window >= ONSET_THRESHOLD)[0]
-        if len(above_nxt):
-            mix_in_frame = s0 + int(above_nxt[0])
+        # Audibility masks for both tracks across the search window
+        cur_audible = cur_fine[s0:s1] >= ONSET_THRESHOLD
+        nxt_audible = nxt_fine[s0:s1] >= ONSET_THRESHOLD
+
+        # The "moment the outgoing track stops being audible" — last cur_audible frame.
+        cur_audible_idx = np.where(cur_audible)[0]
+        if len(cur_audible_idx):
+            cur_silenced_local = int(cur_audible_idx[-1]) + 1   # frame after last
         else:
-            mix_in_frame = int(nxt.detected_start_secs * frames_per_sec)
+            cur_silenced_local = 0
 
-        # mix_out: last frame from mix_in onward where the CURRENT track is
-        # still above ONSET_THRESHOLD.  The frame after that is when the
-        # outgoing track is fully gone.
-        cur_after_mixin = cur_fine[mix_in_frame:s1]
-        above_cur = np.where(cur_after_mixin >= ONSET_THRESHOLD)[0]
-        if len(above_cur):
-            mix_out_frame = mix_in_frame + int(above_cur[-1]) + 1
+        # The "moment the incoming track first becomes audible" — first nxt_audible frame.
+        nxt_audible_idx = np.where(nxt_audible)[0]
+        if len(nxt_audible_idx):
+            nxt_first_local = int(nxt_audible_idx[0])
         else:
-            mix_out_frame = mix_in_frame + 1
+            nxt_first_local = s1 - s0 - 1
 
-        # Sanity: mix_out cannot precede mix_in
-        if mix_out_frame <= mix_in_frame:
-            mix_out_frame = mix_in_frame + 1
+        # ── Build BOTH-AUDIBLE region — frames where cur and nxt overlap.
+        both = cur_audible & nxt_audible
+        both_idx = np.where(both)[0]
+        if len(both_idx):
+            overlap_start_local = int(both_idx[0])
+            overlap_end_local   = int(both_idx[-1]) + 1
+            overlap_secs = (overlap_end_local - overlap_start_local) / frames_per_sec
+            gap_secs     = 0.0
+        else:
+            # No frame where both are audible.  Either there's a gap (cur ends
+            # before nxt starts) or the audibility windows don't agree at all.
+            overlap_secs = 0.0
+            gap_secs     = (nxt_first_local - cur_silenced_local) / frames_per_sec
+            overlap_start_local = cur_silenced_local
+            overlap_end_local   = nxt_first_local
 
-        mix_in_secs  = mix_in_frame  / frames_per_sec
-        mix_out_secs = mix_out_frame / frames_per_sec
+        is_hardcut = (overlap_secs < HARDCUT_OVERLAP_SECS or
+                      gap_secs    > HARDCUT_GAP_SECS)
 
-        # Assign to both tracks — same physical time points.
-        # For the OUTGOING track this transition is its OUT-transition.
-        cur.out_start_secs = mix_in_secs
-        cur.out_end_secs   = mix_out_secs
-        # For the INCOMING track this transition is its IN-transition.
-        nxt.in_start_secs  = mix_in_secs
-        nxt.in_end_secs    = mix_out_secs
+        if is_hardcut:
+            # Single boundary instant — the midpoint of "cur stopped" and
+            # "nxt started".  When there's a gap that's the silence midpoint;
+            # when they brush past each other it's an instantaneous cut.
+            boundary_frame = s0 + (cur_silenced_local + nxt_first_local) // 2
+            t_secs = boundary_frame / frames_per_sec
+            cur.out_start_secs = t_secs
+            cur.out_end_secs   = t_secs
+            cur.is_hardcut_out = True
+            nxt.in_start_secs  = t_secs
+            nxt.in_end_secs    = t_secs
+            nxt.is_hardcut_in  = True
+        else:
+            # Real mix: the overlap window has positive length.
+            t_start = (s0 + overlap_start_local) / frames_per_sec
+            t_end   = (s0 + overlap_end_local)   / frames_per_sec
+            cur.out_start_secs = t_start
+            cur.out_end_secs   = t_end
+            cur.is_hardcut_out = False
+            nxt.in_start_secs  = t_start
+            nxt.in_end_secs    = t_end
+            nxt.is_hardcut_in  = False
 
 
 def build_tempo_ratios(
@@ -855,6 +917,7 @@ def write_tracklist(tracks: list, out_path: str):
         "#", "title", "artist", "status",
         "in_start", "in_end", "out_start", "out_end",
         "in_start_hms", "in_end_hms", "out_start_hms", "out_end_hms",
+        "hardcut_in", "hardcut_out",
         "confidence",
         "bpm_shift_pct", "bpm_shift_min_pct", "bpm_shift_max_pct",
         "bpm_shift_stdev_pct",
@@ -903,6 +966,8 @@ def write_tracklist(tracks: list, out_path: str):
                     "in_end_hms":       fmt_time(t.in_end_secs),
                     "out_start_hms":    fmt_time(t.out_start_secs),
                     "out_end_hms":      fmt_time(t.out_end_secs),
+                    "hardcut_in":       "1" if t.is_hardcut_in  else "",
+                    "hardcut_out":      "1" if t.is_hardcut_out else "",
                     "confidence":       f"{t.confidence:.3f}",
                     "bpm_shift_pct":    f"{(t.tempo_ratio - 1.0) * 100:+.2f}",
                     "bpm_shift_min_pct":   seg_min,
@@ -962,24 +1027,46 @@ def write_heatmap(tracks: list, set_duration: float, out_path: str):
     )
     fig.colorbar(im, ax=ax, label="per-frame similarity (cosine)")
 
-    # Marker set per row:
-    #   in_start  — green ▶ (mix-in begins)            — left edge of in-transition
-    #   in_end    — orange ▶ (previous track gone)     — right edge of in-transition
-    #   out_start — orange ◀ (next track audible)      — left edge of out-transition
-    #   out_end   — red ◀  (this track gone)           — right edge of out-transition
-    # detected_start_secs gets a small ring on top for the global lock.
+    # Marker set per row.  In addition to the triangle glyph, each marker
+    # gets a short vertical line that overhangs the row by EXTEND fraction
+    # of the row height — this makes neighbour rows line up visually so you
+    # can confirm that "out_end of N" really sits at the same set time as
+    # "in_end of N+1" (joint detection guarantees they're equal, but the
+    # overhang makes it readable on the rendered heatmap).
+    #
+    # Triangle / line styling:
+    #   in_start  — green ▶  (mix-in begins)
+    #   in_end    — orange ▶ (previous track gone)        — also = cur.out_end
+    #   out_start — orange ◀ (next track audible)         — also = nxt.in_start
+    #   out_end   — red ◀    (this track gone)
+    # Hard cuts collapse the in/out window to a single instant; in that case
+    # only the *_end marker is drawn (the orange ▶ / red ◀ pair) so the row
+    # doesn't show two near-identical glyphs stacked on top of each other.
+    EXTEND = 0.35           # how far the line extends past the row band
+    LINE_HALF = 0.5 + EXTEND # half-height of the marker line
     for i, t in enumerate(visible):
         if t.detected_start_secs is None:
             continue
 
-        for x_secs_val, color, marker in [
-            (t.in_start_secs,  "lime",       ">"),
-            (t.in_end_secs,    "orange",     ">"),
-            (t.out_start_secs, "darkorange", "<"),
-            (t.out_end_secs,   "red",        "<"),
-        ]:
+        marker_specs = []
+        # in-transition markers — only on first/non-hardcut tracks
+        if not t.is_hardcut_in and t.in_start_secs != t.in_end_secs:
+            marker_specs.append((t.in_start_secs, "lime",   ">"))
+        marker_specs.append((t.in_end_secs,    "orange",     ">"))
+        # out-transition markers — only when not a hard cut
+        if not t.is_hardcut_out and t.out_start_secs != t.out_end_secs:
+            marker_specs.append((t.out_start_secs, "darkorange", "<"))
+        marker_specs.append((t.out_end_secs,   "red",        "<"))
+
+        for x_secs_val, color, marker in marker_specs:
             if x_secs_val is None:
                 continue
+            # Vertical line that overhangs the row above and below
+            ax.plot([x_secs_val, x_secs_val],
+                    [i - LINE_HALF, i + LINE_HALF],
+                    color=color, linewidth=1.0, alpha=0.65,
+                    zorder=4, solid_capstyle="butt")
+            # Triangle glyph at the row centre
             ax.plot(x_secs_val, i, marker=marker, color=color,
                     markersize=7, zorder=5,
                     markeredgecolor="black", markeredgewidth=0.4)
@@ -987,7 +1074,7 @@ def write_heatmap(tracks: list, set_duration: float, out_path: str):
         ring_color = "lime" if t.confidence >= MIN_CONFIDENCE else "red"
         ax.plot(t.detected_start_secs, i, marker="o",
                 markerfacecolor="none", markeredgecolor=ring_color,
-                markeredgewidth=1.4, markersize=10, zorder=4)
+                markeredgewidth=1.4, markersize=10, zorder=6)
 
     tick_vals, tick_labels = _hms_ticks(0, set_duration, n_ticks=24)
     ax.set_xticks(tick_vals)
@@ -1265,6 +1352,8 @@ def write_review_ui(tracks: list, set_duration: float, out_path: str):
             "in_end":     t.in_end_secs,
             "out_start":  t.out_start_secs,
             "out_end":    t.out_end_secs,
+            "hardcut_in":  bool(t.is_hardcut_in),
+            "hardcut_out": bool(t.is_hardcut_out),
             "lock":       t.detected_start_secs,
             "confidence": float(t.confidence),
             "title":      t.title,
@@ -1574,13 +1663,18 @@ function buildChart(divId, label, curveData, windowCenter, windowSecs, role) {
   }
 
   const shapes = [];
-  // Markers: in_start / in_end / out_start / out_end + lock
-  const markerSpecs = [
-    { val: curveData.in_start,  color: '#4ade80', label: 'in_start' },
-    { val: curveData.in_end,    color: '#fbbf24', label: 'in_end' },
-    { val: curveData.out_start, color: '#fb923c', label: 'out_start' },
-    { val: curveData.out_end,   color: '#f87171', label: 'out_end' },
-  ];
+  // Markers: in_start / in_end / out_start / out_end + lock.
+  // Hard cuts collapse a transition window to one instant — for those we draw
+  // only the *_end marker so the chart doesn't show two near-identical lines.
+  const markerSpecs = [];
+  if (!curveData.hardcut_in && curveData.in_start !== curveData.in_end) {
+    markerSpecs.push({ val: curveData.in_start, color: '#4ade80', label: 'in_start' });
+  }
+  markerSpecs.push({ val: curveData.in_end, color: '#fbbf24', label: 'in_end' });
+  if (!curveData.hardcut_out && curveData.out_start !== curveData.out_end) {
+    markerSpecs.push({ val: curveData.out_start, color: '#fb923c', label: 'out_start' });
+  }
+  markerSpecs.push({ val: curveData.out_end, color: '#f87171', label: 'out_end' });
   markerSpecs.forEach(m => {
     if (m.val == null || m.val < x0 || m.val > x1) return;
     shapes.push({
@@ -1652,10 +1746,15 @@ function selectTrack(num) {
   document.getElementById('track-title').textContent =
     `#${num}  ${cur.title} — ${cur.artist}`;
   const conf = cur.confidence != null ? cur.confidence.toFixed(3) : '—';
+  const inDesc = cur.hardcut_in
+    ? `cut @ ${fmtTime(cur.in_end)}`
+    : `[${fmtTime(cur.in_start)} → ${fmtTime(cur.in_end)}]`;
+  const outDesc = cur.hardcut_out
+    ? `cut @ ${fmtTime(cur.out_end)}`
+    : `[${fmtTime(cur.out_start)} → ${fmtTime(cur.out_end)}]`;
   document.getElementById('track-meta').innerHTML =
     `lock @ ${fmtTime(cur.lock)} · conf ${conf} · ` +
-    `in [${fmtTime(cur.in_start)} → ${fmtTime(cur.in_end)}] · ` +
-    `out [${fmtTime(cur.out_start)} → ${fmtTime(cur.out_end)}]`;
+    `in ${inDesc} · out ${outDesc}`;
 
   const charts = document.getElementById('charts');
   charts.innerHTML = `
