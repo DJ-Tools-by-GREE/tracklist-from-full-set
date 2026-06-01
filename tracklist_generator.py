@@ -524,19 +524,27 @@ def resolve_transitions(tracks: list, frames_per_sec: float) -> None:
         cur = detectable[i]
         nxt = detectable[i + 1]
 
-        # Search window: from current track's detected start
-        # to next track's detected end (covers the whole overlap zone)
-        s0 = max(0, int(cur.detected_start_secs * frames_per_sec))
+        # Search window for the transition: from 30 s before the next track's
+        # coarse start to a few seconds after the current track's coarse end.
+        # This bounds the overlap region tightly so brief incidental chord
+        # similarities elsewhere in the set can't be picked up as false starts.
+        BUFFER_SECS = 30.0
+        win_start = max(cur.detected_start_secs,
+                        nxt.detected_start_secs - BUFFER_SECS)
+        win_end   = min(nxt.detected_end_secs,
+                        cur.detected_end_secs + BUFFER_SECS)
+        s0 = max(0, int(win_start * frames_per_sec))
         s1 = min(len(cur.played_curve),
-                 int(nxt.detected_end_secs * frames_per_sec))
+                 len(nxt.played_curve),
+                 int(win_end * frames_per_sec))
         if s1 <= s0:
             continue
 
         cur_fine = _smooth(cur.played_curve, int(FINE_SMOOTH_SECS * frames_per_sec))
         nxt_fine = _smooth(nxt.played_curve, int(FINE_SMOOTH_SECS * frames_per_sec))
 
-        # mix_in: first frame in [cur.detected_start, nxt.detected_end]
-        # where the next track rises above ONSET_THRESHOLD.
+        # mix_in: first frame in the window where the NEXT track rises above
+        # ONSET_THRESHOLD.
         nxt_window = nxt_fine[s0:s1]
         above_nxt  = np.where(nxt_window >= ONSET_THRESHOLD)[0]
         if len(above_nxt):
@@ -544,7 +552,7 @@ def resolve_transitions(tracks: list, frames_per_sec: float) -> None:
         else:
             mix_in_frame = int(nxt.detected_start_secs * frames_per_sec)
 
-        # mix_out: last frame from mix_in onward where the current track is
+        # mix_out: last frame from mix_in onward where the CURRENT track is
         # still above ONSET_THRESHOLD.  The frame after that is when the
         # outgoing track is fully gone.
         cur_after_mixin = cur_fine[mix_in_frame:s1]
@@ -586,7 +594,7 @@ def build_tempo_ratios(max_pct: float, step_pct: float = TEMPO_STEP_PCT) -> list
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def fmt_time(secs: float) -> str:
-    """Format seconds as M:SS.s or H:MM:SS.s."""
+    """Format seconds as M:SS.ss or H:MM:SS.ss."""
     if secs is None:
         return "    ?    "
     secs = max(0.0, secs)
@@ -596,6 +604,48 @@ def fmt_time(secs: float) -> str:
     if h:
         return f"{h}:{m:02d}:{s:05.2f}"
     return f"{m}:{s:05.2f}"
+
+
+def fmt_time_hms(secs: float, with_hours: Optional[bool] = None) -> str:
+    """Format seconds as (hh:)mm:ss.  Used for plot-axis tick labels.
+
+    `with_hours=True` forces HH:MM:SS even when secs < 1 h (so all ticks line
+    up nicely on a long set).  with_hours=None auto-decides based on value.
+    """
+    if secs is None:
+        return "?"
+    secs = max(0.0, secs)
+    h = int(secs) // 3600
+    m = (int(secs) // 60) % 60
+    s = int(round(secs)) % 60
+    show_h = with_hours if with_hours is not None else (h > 0)
+    if show_h:
+        return f"{h:d}:{m:02d}:{s:02d}"
+    return f"{m:d}:{s:02d}"
+
+
+def _hms_ticks(x0: float, x1: float, n_ticks: int = 8) -> tuple:
+    """Build (tick_values, tick_labels) for an axis spanning [x0, x1] seconds.
+
+    Picks a "round" tick spacing — 1, 2, 5, 10, 15, 30 seconds, or 1, 2, 5,
+    10, 15, 30 minutes — so labels land on memorable times.  Forces HH:MM:SS
+    formatting if the window covers an hour or more.
+    """
+    span = max(1e-3, x1 - x0)
+    target = span / max(1, n_ticks)
+    candidates_secs = [
+        1, 2, 5, 10, 15, 30,
+        60, 120, 300, 600, 900, 1800,
+        3600, 7200,
+    ]
+    step = next((c for c in candidates_secs if c >= target), candidates_secs[-1])
+    first = int(np.ceil(x0 / step)) * step
+    vals = list(np.arange(first, x1 + step / 2, step))
+    if not vals:
+        vals = [x0, x1]
+    use_hours = x1 >= 3600
+    labels = [fmt_time_hms(v, with_hours=use_hours) for v in vals]
+    return vals, labels
 
 
 def write_tracklist(tracks: list, out_path: str):
@@ -695,7 +745,7 @@ def write_heatmap(tracks: list, set_duration: float, out_path: str):
         grid,
         aspect="auto",
         origin="upper",
-        extent=[0, set_duration / 60, len(visible) - 0.5, -0.5],
+        extent=[0, set_duration, len(visible) - 0.5, -0.5],
         cmap="magma",
         vmin=0.0,
         vmax=1.0,
@@ -708,13 +758,16 @@ def write_heatmap(tracks: list, set_duration: float, out_path: str):
         if t.detected_start_secs is None:
             continue
         marker_color = "lime" if t.confidence >= MIN_CONFIDENCE else "red"
-        ax.plot(t.detected_start_secs / 60, i, marker="o",
+        ax.plot(t.detected_start_secs, i, marker="o",
                 markerfacecolor="none", markeredgecolor=marker_color,
                 markeredgewidth=1.4, markersize=8, zorder=5)
 
+    tick_vals, tick_labels = _hms_ticks(0, set_duration, n_ticks=12)
+    ax.set_xticks(tick_vals)
+    ax.set_xticklabels(tick_labels)
     ax.set_yticks(range(len(visible)))
     ax.set_yticklabels([f"{t.number:>2}  {t.title[:38]}" for t in visible], fontsize=8)
-    ax.set_xlabel("Set time (minutes)")
+    ax.set_xlabel("Set time (h:mm:ss)" if set_duration >= 3600 else "Set time (m:ss)")
     ax.set_title("Per-track playback heatmap — green ◯ = locked, red ◯ = low confidence")
     ax.grid(axis="x", color="white", alpha=0.15, linewidth=0.4)
     fig.tight_layout()
@@ -772,17 +825,21 @@ def write_interactive_transitions(tracks: list, set_duration: float, out_path: s
         x0 = max(0.0, center - TRANSITION_WINDOW_SECS)
         x1 = min(set_duration, center + TRANSITION_WINDOW_SECS)
 
-        # Build the slice for this track
+        # Build the slice for this track.  customdata carries the formatted
+        # h:mm:ss timestamp so the hover readout matches the axis ticks.
         mask = (t.played_times_secs >= x0) & (t.played_times_secs <= x1)
+        x_secs    = t.played_times_secs[mask]
+        x_labels  = [fmt_time_hms(s, with_hours=set_duration >= 3600) for s in x_secs]
         fig.add_trace(
             go.Scatter(
-                x=t.played_times_secs[mask],
+                x=x_secs,
                 y=t.played_curve[mask],
+                customdata=x_labels,
                 mode="lines",
                 name=f"#{t.number} {t.title[:30]}",
                 line=dict(width=2, color="#1f77b4"),
                 hovertemplate=(
-                    "set time=%{x:.2f}s<br>"
+                    "set time=%{customdata}<br>"
                     f"#{t.number} {t.title[:40]}<br>"
                     "similarity=%{y:.3f}<extra></extra>"
                 ),
@@ -795,15 +852,18 @@ def write_interactive_transitions(tracks: list, set_duration: float, out_path: s
         if i > 0:
             prev = visible[i - 1]
             mask_prev = (prev.played_times_secs >= x0) & (prev.played_times_secs <= x1)
+            x_prev   = prev.played_times_secs[mask_prev]
+            lbl_prev = [fmt_time_hms(s, with_hours=set_duration >= 3600) for s in x_prev]
             fig.add_trace(
                 go.Scatter(
-                    x=prev.played_times_secs[mask_prev],
+                    x=x_prev,
                     y=prev.played_curve[mask_prev],
+                    customdata=lbl_prev,
                     mode="lines",
                     name=f"#{prev.number} {prev.title[:30]}",
                     line=dict(width=2, color="#ff7f0e", dash="dot"),
                     hovertemplate=(
-                        "set time=%{x:.2f}s<br>"
+                        "set time=%{customdata}<br>"
                         f"#{prev.number} {prev.title[:40]} (outgoing)<br>"
                         "similarity=%{y:.3f}<extra></extra>"
                     ),
@@ -841,9 +901,14 @@ def write_interactive_transitions(tracks: list, set_duration: float, out_path: s
                 line=dict(color=color, width=1, dash="dot"),
             )
 
+        # h:mm:ss tick labels for this panel's x-axis
+        tick_vals, tick_labels = _hms_ticks(x0, x1, n_ticks=6)
         fig.update_xaxes(
-            title_text="set time (s)" if row == rows else "",
+            title_text="set time (h:mm:ss)" if row == rows else "",
             range=[x0, x1],
+            tickmode="array",
+            tickvals=tick_vals,
+            ticktext=tick_labels,
             row=row, col=col,
         )
         fig.update_yaxes(range=[0, 1], row=row, col=col)
