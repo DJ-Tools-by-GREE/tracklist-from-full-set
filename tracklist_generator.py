@@ -49,10 +49,10 @@ except ImportError as exc:
 
 # ── Inputs ────────────────────────────────────────────────────────────────────
 PLAYLIST_CSV = os.path.expanduser(
-    "~/Git_Repos/tracklist-from-full-set/Party Set V4.csv"
+    "~/Git Repos/tracklist-from-full-set/Party Set V4.csv"
 )
 SET_WAV = os.path.expanduser(
-    "~/Library/CloudStorage/OneDrive-Personal/GREE/My Sets/Abiball Party Set V4/fullSet.wav"
+    "~/Library/CloudStorage/OneDrive-Personal/GREE/My Sets/Abiball Party Set V4/Party Set V4.wav"
 )
 ENGINE_DB_PATH = os.path.expanduser("~/Music/Engine Library/Database2/m.db")
 
@@ -67,7 +67,7 @@ OUTPUT_HEATMAP   = os.path.join(OUTPUT_DIR, "confidence_heatmap.png")
 # Track numbers (from the CSV "#" column) whose VOCALS only are layered over
 # another track's backing.  These tracks are skipped — they don't appear in
 # the tracklist and don't advance the timeline.
-MASHUP_TRACK_NUMBERS: list = []     # e.g. [12, 18]
+MASHUP_TRACK_NUMBERS: list = [10,11,30]     # e.g. [12, 18]
 
 # ── Tempo search ──────────────────────────────────────────────────────────────
 # DJ pitch-bend can shift speed/pitch by a few percent.  We search across
