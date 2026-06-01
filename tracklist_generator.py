@@ -39,8 +39,15 @@ try:
 except ImportError as exc:
     sys.exit(
         f"Missing dependency: {exc}\n"
-        "Install with: pip install librosa soundfile numpy scipy matplotlib mutagen"
+        "Install with: pip install librosa soundfile numpy scipy matplotlib mutagen plotly"
     )
+
+try:
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    _HAS_PLOTLY = True
+except ImportError:
+    _HAS_PLOTLY = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -62,6 +69,7 @@ OUTPUT_DIR = os.path.expanduser(
 )
 OUTPUT_TRACKLIST = os.path.join(OUTPUT_DIR, "tracklist.txt")
 OUTPUT_HEATMAP   = os.path.join(OUTPUT_DIR, "confidence_heatmap.png")
+OUTPUT_INTERACTIVE = os.path.join(OUTPUT_DIR, "transitions.html")
 
 # ── Mashup overrides ──────────────────────────────────────────────────────────
 # Track numbers (from the CSV "#" column) whose VOCALS only are layered over
@@ -86,8 +94,14 @@ ANALYSIS_SR        = 22050     # downsample target for analysis
 HOP_LENGTH         = 1024      # ~46 ms hop (chroma frame rate ≈ 21.5 Hz)
 MIN_CONFIDENCE     = 0.40      # below this → retry with wide tempo range
 PLAYED_THRESHOLD   = 0.55      # per-frame similarity threshold for "song is audible"
+MIN_RUN_SECS       = 8.0       # ignore high-similarity bursts shorter than this
+                               # (filters brief chord-match spikes during transitions)
 SEARCH_LOOKBACK    = 20        # search this many seconds before previous track's start
 SEARCH_LOOKAHEAD   = 360       # search up to this many seconds after previous start
+
+# ── Output settings ───────────────────────────────────────────────────────────
+TRANSITION_WINDOW_SECS = 60.0   # seconds before/after each detected start to show
+                                # in the interactive transition plot
 
 # ── Path remap (Engine DJ paths → current Mac locations) ──────────────────────
 PATH_REMAPS = [
@@ -118,6 +132,11 @@ class Track:
     tempo_ratio:          float = 1.0
     score_curve:          Optional[np.ndarray] = None   # full score curve over set timeline
     score_offsets_secs:   Optional[np.ndarray] = None   # x-axis (set time) for score_curve
+    # Per-frame similarity at the locked alignment — high while the song is
+    # audible, low otherwise.  This is the curve used in the interactive plot
+    # and the heatmap; gives much better contrast than the cross-correlation.
+    played_curve:         Optional[np.ndarray] = None
+    played_times_secs:    Optional[np.ndarray] = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -307,56 +326,90 @@ def search_with_tempo_ratios(
     return best
 
 
-def detect_played_region(
+def compute_played_curve(
     set_chroma: np.ndarray,
     ref_chroma: np.ndarray,
     offset:     int,
-    threshold:  float = PLAYED_THRESHOLD,
-) -> tuple:
-    """Walk along the alignment, flag frames where similarity > threshold,
-    and return (audible_start_frame_in_set, audible_end_frame_in_set,
-    mean_similarity_over_played_region).
+) -> np.ndarray:
+    """Per-frame cosine similarity between set and ref at the given alignment.
 
-    The longest run of high-similarity frames is treated as the play period;
-    isolated spikes (likely from transitions where chroma briefly aligns with
-    a different track) are ignored.  Falls back to the alignment endpoints
-    when no run is found.
+    Returns an array indexed by *set frame*: played[s] = sim(set[s], ref[s-offset])
+    when the ref overlaps that set frame, else 0.  This is the curve that
+    cleanly separates "song audible" from "song silent" — much higher contrast
+    than the windowed cross-correlation used during search.
     """
-    n_ref = ref_chroma.shape[1]
     n_set = set_chroma.shape[1]
+    n_ref = ref_chroma.shape[1]
+    played = np.zeros(n_set, dtype=np.float32)
+    s0 = max(0, offset)
+    s1 = min(n_set, offset + n_ref)
+    if s1 > s0:
+        # Per-frame dot product (chroma is L2-normalized, so this is cosine sim).
+        ref_slice = ref_chroma[:, s0 - offset : s1 - offset]
+        played[s0:s1] = np.einsum("ij,ij->j", set_chroma[:, s0:s1], ref_slice)
+    return played
 
-    sims = np.zeros(n_ref, dtype=np.float32)
-    for t in range(n_ref):
-        s = offset + t
-        if 0 <= s < n_set:
-            sims[t] = float(np.dot(set_chroma[:, s], ref_chroma[:, t]))
 
-    # Smooth so brief drops/spikes don't end runs prematurely
-    win = max(11, n_ref // 80)
+def detect_played_region(
+    played_curve:    np.ndarray,
+    sample_rate_fps: float,
+    threshold:       float = PLAYED_THRESHOLD,
+    min_run_secs:    float = MIN_RUN_SECS,
+    seed_frame:      Optional[int] = None,
+) -> tuple:
+    """From the per-frame played-curve, find the run that represents the song.
+
+    A "run" is a contiguous span of frames whose smoothed similarity exceeds
+    `threshold`.  We discard runs shorter than `min_run_secs` (these are brief
+    chord matches during transitions, not real playback).  Of the runs that
+    remain, we pick the one closest to `seed_frame` (the cross-correlation
+    peak) — that is almost always the correct one and avoids the bug where
+    the song's outro overlap with the *next* track gets picked as the start.
+
+    Returns (start_frame, end_frame, mean_similarity).
+    """
+    n = len(played_curve)
+    win = max(11, int(round(2.0 * sample_rate_fps)))   # ~2 s smoothing
     if win % 2 == 0:
         win += 1
     kernel = np.ones(win, dtype=np.float32) / win
-    smooth = np.convolve(sims, kernel, mode="same")
+    smooth = np.convolve(played_curve, kernel, mode="same")
 
     above = smooth > threshold
     if not above.any():
-        return offset, offset + n_ref, float(smooth.mean())
+        # Nothing reached threshold — fall back to whatever we had
+        idx = int(np.argmax(smooth)) if seed_frame is None else seed_frame
+        return idx, idx + 1, float(smooth.max())
 
-    # Find longest contiguous run
     diffs  = np.diff(above.astype(np.int8))
     starts = list(np.where(diffs ==  1)[0] + 1)
     ends   = list(np.where(diffs == -1)[0] + 1)
     if above[0]:
         starts = [0] + starts
     if above[-1]:
-        ends = ends + [n_ref]
+        ends = ends + [n]
     runs = list(zip(starts, ends))
-    longest = max(runs, key=lambda x: x[1] - x[0])
 
-    audible_start = offset + longest[0]
-    audible_end   = offset + longest[1]
-    mean_sim = float(smooth[longest[0]:longest[1]].mean())
-    return audible_start, audible_end, mean_sim
+    min_run_frames = int(round(min_run_secs * sample_rate_fps))
+    long_runs = [(s, e) for s, e in runs if (e - s) >= min_run_frames]
+    if not long_runs:
+        # Nothing sustained — relax min length but still prefer longest
+        long_runs = sorted(runs, key=lambda r: r[1] - r[0], reverse=True)[:3]
+
+    if seed_frame is not None:
+        # Pick the run that contains the seed; if none does, the closest one.
+        containing = [r for r in long_runs if r[0] <= seed_frame < r[1]]
+        if containing:
+            chosen = max(containing, key=lambda r: r[1] - r[0])
+        else:
+            chosen = min(long_runs,
+                         key=lambda r: min(abs(seed_frame - r[0]),
+                                           abs(seed_frame - r[1])))
+    else:
+        chosen = max(long_runs, key=lambda r: r[1] - r[0])
+
+    s, e = chosen
+    return s, e, float(smooth[s:e].mean())
 
 
 def build_tempo_ratios(max_pct: float, step_pct: float = TEMPO_STEP_PCT) -> list:
@@ -417,25 +470,27 @@ def write_tracklist(tracks: list, out_path: str):
 def write_heatmap(tracks: list, set_duration: float, out_path: str):
     """Render a confidence heatmap: x = set time, y = track index, color = score.
 
-    Each row shows the cross-correlation score curve for that track at its
-    chosen tempo ratio.  A red marker on each row marks the detected start.
-    Tracks with poor matches show low colour everywhere — easy to eyeball.
+    Each row shows the *per-frame similarity* between the set and that track at
+    its locked alignment — high while the song is audible, low otherwise.
+    Much higher contrast than the raw cross-correlation curve, so the
+    "song is/isn't playing" boundary is visible at a glance.
+
+    A green ◯ marks each detected start (red ◯ if confidence is low).
     """
     visible = [t for t in tracks if not t.is_mashup and not t.is_missing
-               and t.score_curve is not None]
+               and t.played_curve is not None]
     if not visible:
         print("  (no tracks to plot)")
         return
 
-    # Resample every track's score curve to a common x-axis (set time)
+    # Resample every track's played curve to a common x-axis (set time)
     n_x = min(4000, int(set_duration * 4))   # ~4 px / sec, cap at 4k
     x_secs = np.linspace(0, set_duration, n_x)
     grid = np.full((len(visible), n_x), np.nan, dtype=np.float32)
 
     for i, t in enumerate(visible):
-        x_track = t.score_offsets_secs
-        y_track = t.score_curve
-        # Clip to valid set range
+        x_track = t.played_times_secs
+        y_track = t.played_curve
         mask = (x_track >= 0) & (x_track <= set_duration)
         if mask.sum() < 2:
             continue
@@ -454,7 +509,7 @@ def write_heatmap(tracks: list, set_duration: float, out_path: str):
         vmax=1.0,
         interpolation="nearest",
     )
-    cbar = fig.colorbar(im, ax=ax, label="cross-correlation (cosine similarity)")
+    fig.colorbar(im, ax=ax, label="per-frame similarity (cosine)")
 
     # Detected-start markers
     for i, t in enumerate(visible):
@@ -468,12 +523,142 @@ def write_heatmap(tracks: list, set_duration: float, out_path: str):
     ax.set_yticks(range(len(visible)))
     ax.set_yticklabels([f"{t.number:>2}  {t.title[:38]}" for t in visible], fontsize=8)
     ax.set_xlabel("Set time (minutes)")
-    ax.set_title("Tracklist confidence heatmap — green ◯ = locked, red ◯ = low confidence")
+    ax.set_title("Per-track playback heatmap — green ◯ = locked, red ◯ = low confidence")
     ax.grid(axis="x", color="white", alpha=0.15, linewidth=0.4)
     fig.tight_layout()
     fig.savefig(out_path, dpi=140)
     plt.close(fig)
     print(f"  Heatmap       : {out_path}")
+
+
+def write_interactive_transitions(tracks: list, set_duration: float, out_path: str):
+    """Render an interactive HTML plot focused on transition zones.
+
+    For each transition (track N → N+1), shows the played-curves of both
+    tracks zoomed into a ±TRANSITION_WINDOW_SECS window around the detected
+    start of track N+1.  Plotly handles zoom/pan/hover in the browser.
+
+    Use this when a detected start looks slightly off — you can see exactly
+    where each track's audio ramps up/down and pick the right boundary by eye.
+    """
+    if not _HAS_PLOTLY:
+        print("  (plotly not installed — skipping interactive plot. "
+              "pip install plotly)")
+        return
+
+    visible = [t for t in tracks if not t.is_mashup and not t.is_missing
+               and t.played_curve is not None
+               and t.detected_start_secs is not None]
+    if len(visible) < 2:
+        print("  (not enough tracks for interactive transitions)")
+        return
+
+    n = len(visible)
+    cols = 2
+    rows = (n + cols - 1) // cols
+
+    titles = []
+    for i, t in enumerate(visible):
+        prev_label = f"← {visible[i-1].number}" if i > 0 else "—"
+        titles.append(
+            f"Transition into #{t.number}: {t.title[:42]}  "
+            f"(prev: {prev_label}) @ {fmt_time(t.detected_start_secs)}"
+        )
+
+    fig = make_subplots(
+        rows=rows, cols=cols,
+        subplot_titles=titles,
+        vertical_spacing=0.04,
+        horizontal_spacing=0.06,
+    )
+
+    for i, t in enumerate(visible):
+        row = i // cols + 1
+        col = i % cols + 1
+
+        center = t.detected_start_secs
+        x0 = max(0.0, center - TRANSITION_WINDOW_SECS)
+        x1 = min(set_duration, center + TRANSITION_WINDOW_SECS)
+
+        # Build the slice for this track
+        mask = (t.played_times_secs >= x0) & (t.played_times_secs <= x1)
+        fig.add_trace(
+            go.Scatter(
+                x=t.played_times_secs[mask],
+                y=t.played_curve[mask],
+                mode="lines",
+                name=f"#{t.number} {t.title[:30]}",
+                line=dict(width=2, color="#1f77b4"),
+                hovertemplate=(
+                    "set time=%{x:.2f}s<br>"
+                    f"#{t.number} {t.title[:40]}<br>"
+                    "similarity=%{y:.3f}<extra></extra>"
+                ),
+                showlegend=False,
+            ),
+            row=row, col=col,
+        )
+
+        # Previous track (the one ending around this transition)
+        if i > 0:
+            prev = visible[i - 1]
+            mask_prev = (prev.played_times_secs >= x0) & (prev.played_times_secs <= x1)
+            fig.add_trace(
+                go.Scatter(
+                    x=prev.played_times_secs[mask_prev],
+                    y=prev.played_curve[mask_prev],
+                    mode="lines",
+                    name=f"#{prev.number} {prev.title[:30]}",
+                    line=dict(width=2, color="#ff7f0e", dash="dot"),
+                    hovertemplate=(
+                        "set time=%{x:.2f}s<br>"
+                        f"#{prev.number} {prev.title[:40]} (outgoing)<br>"
+                        "similarity=%{y:.3f}<extra></extra>"
+                    ),
+                    showlegend=False,
+                ),
+                row=row, col=col,
+            )
+
+        # Detected-start vertical line
+        fig.add_shape(
+            type="line",
+            x0=center, x1=center, y0=0, y1=1,
+            xref=f"x{i+1}" if i > 0 else "x",
+            yref=f"y{i+1}" if i > 0 else "y",
+            line=dict(color="lime" if t.confidence >= MIN_CONFIDENCE else "red",
+                      width=1.5, dash="dash"),
+        )
+
+        # Threshold line
+        fig.add_shape(
+            type="line",
+            x0=x0, x1=x1, y0=PLAYED_THRESHOLD, y1=PLAYED_THRESHOLD,
+            xref=f"x{i+1}" if i > 0 else "x",
+            yref=f"y{i+1}" if i > 0 else "y",
+            line=dict(color="gray", width=1, dash="dot"),
+        )
+
+        fig.update_xaxes(
+            title_text="set time (s)" if row == rows else "",
+            range=[x0, x1],
+            row=row, col=col,
+        )
+        fig.update_yaxes(range=[0, 1], row=row, col=col)
+
+    fig.update_layout(
+        title=("Transition explorer — incoming track (blue solid) and "
+               "outgoing track (orange dotted) similarity over set time. "
+               "Dashed vertical = detected start. Hover for exact times."),
+        height=max(400, rows * 240),
+        plot_bgcolor="white",
+        font=dict(size=11),
+    )
+    for ann in fig.layout.annotations:
+        ann.font.size = 10
+
+    fig.write_html(out_path, include_plotlyjs="cdn")
+    print(f"  Transitions   : {out_path}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -574,16 +759,25 @@ def main():
 
         # Refine to audible region (ignore intro silence / pre-hotcue audio)
         ref_chroma_at_best = warp_chroma(ref_chroma_orig, best["ratio"])
-        audible_start_f, audible_end_f, played_sim = detect_played_region(
+
+        # Per-frame similarity at the locked alignment — high during playback,
+        # low otherwise.  This is what gives the heatmap real contrast.
+        played_curve = compute_played_curve(
             set_chroma, ref_chroma_at_best, best["offset"]
+        )
+        seed_frame = best["offset"] + ref_chroma_at_best.shape[1] // 4
+        audible_start_f, audible_end_f, played_sim = detect_played_region(
+            played_curve, frames_per_sec, seed_frame=seed_frame
         )
 
         t.detected_start_secs = audible_start_f / frames_per_sec
         t.detected_end_secs   = audible_end_f   / frames_per_sec
-        t.confidence          = max(best["confidence"], played_sim)
+        t.confidence          = played_sim
         t.tempo_ratio         = best["ratio"]
         t.score_curve         = best["score"].astype(np.float32)
         t.score_offsets_secs  = best["score_offsets"] / frames_per_sec
+        t.played_curve        = played_curve
+        t.played_times_secs   = np.arange(len(played_curve)) / frames_per_sec
 
         bpm_shift = (best["ratio"] - 1.0) * 100
         flag      = "✓" if t.confidence >= MIN_CONFIDENCE else "?"
@@ -597,6 +791,7 @@ def main():
     print("\nWriting outputs …")
     write_tracklist(tracks, OUTPUT_TRACKLIST)
     write_heatmap(tracks, set_duration, OUTPUT_HEATMAP)
+    write_interactive_transitions(tracks, set_duration, OUTPUT_INTERACTIVE)
 
 
 if __name__ == "__main__":
