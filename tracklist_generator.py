@@ -20,6 +20,7 @@ Dependencies:
 """
 
 import csv
+import json
 import os
 import sys
 import subprocess
@@ -70,6 +71,7 @@ OUTPUT_DIR = os.path.expanduser(
 OUTPUT_TRACKLIST   = os.path.join(OUTPUT_DIR, "tracklist.csv")
 OUTPUT_HEATMAP     = os.path.join(OUTPUT_DIR, "confidence_heatmap.png")
 OUTPUT_INTERACTIVE = os.path.join(OUTPUT_DIR, "transitions.html")
+OUTPUT_REVIEW_UI   = os.path.join(OUTPUT_DIR, "review.html")
 
 # ── Mashup overrides ──────────────────────────────────────────────────────────
 # Track numbers (from the CSV "#" column) whose VOCALS only are layered over
@@ -78,16 +80,28 @@ OUTPUT_INTERACTIVE = os.path.join(OUTPUT_DIR, "transitions.html")
 MASHUP_TRACK_NUMBERS: list = [10,11,30]     # e.g. [12, 18]
 
 # ── Tempo search ──────────────────────────────────────────────────────────────
-# DJ pitch-bend can shift speed/pitch by a few percent.  We search across
-# DEFAULT_TEMPO_PCT first; if confidence is too low we automatically retry
-# with WIDE_TEMPO_PCT (covers e.g. 121 → 130 BPM ≈ +7.4%).
-DEFAULT_TEMPO_PCT = 3.0     # ±%
-WIDE_TEMPO_PCT    = 10.0    # ±%  (used when default fails confidence threshold)
-TEMPO_STEP_PCT    = 0.5     # search granularity (smaller = slower but finer)
+# DJ pitch-bend can shift speed/pitch by a few percent.  The search runs in two
+# stages: a coarse sweep at TEMPO_STEP_PCT, then a fine refinement around the
+# winning ratio at REFINE_STEP_PCT for sub-step precision (~0.05 %).
+# WIDE_TEMPO_PCT covers e.g. 121 → 130 BPM ≈ +7.4 %.
+DEFAULT_TEMPO_PCT = 3.0     # ±%   coarse search range (default)
+WIDE_TEMPO_PCT    = 10.0    # ±%   coarse search range (auto-retry on low confidence)
+TEMPO_STEP_PCT    = 0.5     # %    coarse grid step
+REFINE_STEP_PCT   = 0.05    # %    fine grid step around the coarse winner
+REFINE_HALF_WIDTH = 0.6     # %    fine grid spans ±this around the coarse winner
 
 # Per-track explicit override (CSV track number → max ±% to search).
 # Use this to force a wide search for a transition you know is dramatic.
 TEMPO_OVERRIDES: dict = {}  # e.g. {15: 12.0}
+
+# Per-segment ratio drift refinement — after the global lock, the played region
+# is split into chunks and each chunk re-aligned at sub-step resolution so that
+# slow speed changes during a track (DJ rides the pitch fader) don't cause the
+# played-curve to drift out of phase mid-track.
+SEGMENT_REFINE_ENABLED   = True
+SEGMENT_LENGTH_SECS      = 30.0   # length of each per-segment ratio probe
+SEGMENT_RATIO_HALF_WIDTH = 1.0    # ±% search around the global ratio per segment
+SEGMENT_RATIO_STEP       = 0.05   # % step inside each segment
 
 # ── Detection settings ────────────────────────────────────────────────────────
 ANALYSIS_SR        = 22050     # downsample target for analysis
@@ -155,6 +169,15 @@ class Track:
     in_end_secs:     Optional[float] = None
     out_start_secs:  Optional[float] = None
     out_end_secs:    Optional[float] = None
+
+    # Per-segment ratio drift — captures slow speed changes within a track.
+    # segment_centers_secs[i] is the set-time at the centre of segment i,
+    # segment_ratios[i] is that segment's best playback ratio relative to the
+    # source file (1.0 = original speed; >1 = faster).  Used to render the
+    # BPM-over-time line in the heatmap and to back the "real" tempo column
+    # in the CSV (mean ± stdev).
+    segment_centers_secs: Optional[np.ndarray] = None
+    segment_ratios:       Optional[np.ndarray] = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -578,15 +601,174 @@ def resolve_transitions(tracks: list, frames_per_sec: float) -> None:
         nxt.in_end_secs    = mix_out_secs
 
 
-def build_tempo_ratios(max_pct: float, step_pct: float = TEMPO_STEP_PCT) -> list:
-    """Build a list of speed ratios spanning ±max_pct in step_pct increments."""
+def build_tempo_ratios(
+    max_pct:    float,
+    step_pct:   float = TEMPO_STEP_PCT,
+    center_pct: float = 0.0,
+) -> list:
+    """Build a list of speed ratios spanning center ±max_pct in step_pct increments."""
     n_steps = max(1, int(round(max_pct / step_pct)))
     pcts = np.unique(np.concatenate([
-        [0.0],
-        np.arange(step_pct, max_pct + step_pct / 2, step_pct),
-        -np.arange(step_pct, max_pct + step_pct / 2, step_pct),
+        [center_pct],
+        center_pct + np.arange(step_pct, max_pct + step_pct / 2, step_pct),
+        center_pct - np.arange(step_pct, max_pct + step_pct / 2, step_pct),
     ]))
     return [1.0 + p / 100.0 for p in sorted(pcts)]
+
+
+def search_tempo_two_stage(
+    set_chroma:         np.ndarray,
+    ref_chroma_orig:    np.ndarray,
+    coarse_max_pct:     float,
+    search_start_frame: int,
+    search_end_frame:   int,
+) -> dict:
+    """Two-stage tempo search: coarse sweep, then fine refinement around the winner.
+
+    Stage 1 — coarse: ±coarse_max_pct in TEMPO_STEP_PCT steps (default 0.5 %).
+    Stage 2 — fine:   ±REFINE_HALF_WIDTH around the coarse winner in
+                      REFINE_STEP_PCT steps (default 0.05 %).
+
+    Stage 2 typically gains 0.0–0.3 % accuracy and noticeably improves the
+    played-curve stability through the middle of long tracks where even a
+    0.25 % bias accumulates into many seconds of drift.
+    """
+    coarse_ratios = build_tempo_ratios(coarse_max_pct, TEMPO_STEP_PCT)
+    coarse_best = search_with_tempo_ratios(
+        set_chroma, ref_chroma_orig, coarse_ratios,
+        search_start_frame, search_end_frame,
+    )
+    if coarse_best is None:
+        return None
+
+    coarse_pct = (coarse_best["ratio"] - 1.0) * 100.0
+    fine_ratios = build_tempo_ratios(
+        REFINE_HALF_WIDTH, REFINE_STEP_PCT, center_pct=coarse_pct,
+    )
+    fine_best = search_with_tempo_ratios(
+        set_chroma, ref_chroma_orig, fine_ratios,
+        search_start_frame, search_end_frame,
+    )
+    if fine_best is None or fine_best["confidence"] <= coarse_best["confidence"]:
+        return coarse_best
+    return fine_best
+
+
+def refine_tempo_per_segment(
+    set_chroma:      np.ndarray,
+    ref_chroma_orig: np.ndarray,
+    global_offset:   int,
+    global_ratio:    float,
+    frames_per_sec:  float,
+) -> tuple:
+    """Find a separate best playback ratio for each segment of the played region.
+
+    Slow speed changes within a track (DJ rides the pitch fader, or cues a
+    new beatgrid) cause a single global ratio to drift out of phase with the
+    actual audio after a few minutes.  Per-segment refinement fixes this:
+
+        1. Slice the time-warped ref into SEGMENT_LENGTH_SECS chunks.
+        2. For each chunk, sweep ±SEGMENT_RATIO_HALF_WIDTH around the global
+           ratio in SEGMENT_RATIO_STEP increments and pick the local winner.
+        3. Use those per-segment ratios to build a piecewise-warped ref
+           chroma whose timing follows the actual set audio frame-for-frame.
+
+    Returns (segment_centers_set_secs, segment_ratios, warped_ref_chroma).
+    The warped_ref_chroma can then be passed to compute_played_curve() to
+    produce a much cleaner (less drifty) played-curve.
+    """
+    ref_warped = warp_chroma(ref_chroma_orig, global_ratio)
+    n_ref      = ref_warped.shape[1]
+    n_set      = set_chroma.shape[1]
+
+    seg_frames = int(round(SEGMENT_LENGTH_SECS * frames_per_sec))
+    if seg_frames <= 0 or n_ref < 2 * seg_frames:
+        # Track too short — fall back to global ratio everywhere.
+        return (np.array([global_offset / frames_per_sec]),
+                np.array([global_ratio]),
+                ref_warped)
+
+    # Iterate over set-frame segments where this track is supposed to be playing.
+    seg_starts_set = list(range(global_offset,
+                                min(global_offset + n_ref, n_set) - seg_frames,
+                                seg_frames))
+    if not seg_starts_set:
+        return (np.array([global_offset / frames_per_sec]),
+                np.array([global_ratio]),
+                ref_warped)
+
+    centers_set, ratios = [], []
+    rebuilt = ref_warped.copy()
+    n_set_chroma = set_chroma.shape[1]
+
+    # Track how far the cumulative drift has shifted us in the original ref.
+    # We re-anchor each segment at the previous segment's end in set time so
+    # short-term ratio changes don't accumulate position errors.
+    cur_ref_pos = 0  # position inside ref_warped that maps to seg_starts_set[0]
+
+    candidate_pcts = np.arange(
+        -SEGMENT_RATIO_HALF_WIDTH,
+        SEGMENT_RATIO_HALF_WIDTH + SEGMENT_RATIO_STEP / 2,
+        SEGMENT_RATIO_STEP,
+    )
+
+    for s_set in seg_starts_set:
+        # Set-side window for this segment
+        set_seg = set_chroma[:, s_set : s_set + seg_frames]
+        if set_seg.shape[1] < 4:
+            continue
+
+        # For each candidate local ratio, time-stretch the ORIGINAL ref's
+        # corresponding slice and score it against set_seg.
+        # The original-ref slice covers seg_frames * global_ratio frames
+        # of the unwarped reference, anchored at cur_ref_pos / global_ratio.
+        ref_orig_anchor = int(round(cur_ref_pos * global_ratio))
+        ref_orig_len    = int(round(seg_frames * global_ratio))
+        ref_orig_slice  = ref_chroma_orig[
+            :,
+            ref_orig_anchor : min(ref_orig_anchor + ref_orig_len,
+                                  ref_chroma_orig.shape[1]),
+        ]
+        if ref_orig_slice.shape[1] < 4:
+            continue
+
+        best_pct, best_score = 0.0, -np.inf
+        for pct in candidate_pcts:
+            local_ratio = global_ratio + pct / 100.0
+            warped_seg = warp_chroma(ref_orig_slice, local_ratio)
+            n_seg = min(seg_frames, warped_seg.shape[1])
+            if n_seg < 4:
+                continue
+            score = float(np.einsum(
+                "ij,ij->",
+                set_seg[:, :n_seg],
+                warped_seg[:, :n_seg],
+            )) / n_seg
+            if score > best_score:
+                best_score = score
+                best_pct   = pct
+
+        local_ratio = global_ratio + best_pct / 100.0
+        ratios.append(local_ratio)
+        centers_set.append((s_set + seg_frames / 2) / frames_per_sec)
+
+        # Rebuild this segment of ref_warped using the local ratio so the
+        # final played-curve aligns frame-for-frame.
+        warped_seg = warp_chroma(ref_orig_slice, local_ratio)
+        n_seg = min(seg_frames, warped_seg.shape[1], n_ref - cur_ref_pos)
+        if n_seg > 0:
+            rebuilt[:, cur_ref_pos : cur_ref_pos + n_seg] = warped_seg[:, :n_seg]
+
+        cur_ref_pos += seg_frames
+
+    if not ratios:
+        return (np.array([global_offset / frames_per_sec]),
+                np.array([global_ratio]),
+                ref_warped)
+
+    return (np.array(centers_set, dtype=np.float64),
+            np.array(ratios,      dtype=np.float64),
+            rebuilt)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -659,7 +841,12 @@ def write_tracklist(tracks: list, out_path: str):
         out_start, out_end     — outgoing transition window (set time)
         in_start_hms, in_end_hms, out_start_hms, out_end_hms — same, formatted
         confidence             — locked-region mean similarity
-        bpm_shift_pct          — playback-speed shift (%, vs original)
+        bpm_shift_pct          — global playback-speed shift (%, vs original)
+        bpm_shift_min_pct      — slowest segment within the track
+        bpm_shift_max_pct      — fastest segment within the track
+        bpm_shift_stdev_pct    — stdev across segments (intra-track variation)
+        original_bpm           — the BPM column from the playlist CSV
+        played_bpm_mean        — original_bpm × mean_segment_ratio (empty if BPM=0)
 
     All timestamps are set-time seconds (decimals, ms precision).
     Mashup and missing tracks have empty timestamp cells.
@@ -668,7 +855,10 @@ def write_tracklist(tracks: list, out_path: str):
         "#", "title", "artist", "status",
         "in_start", "in_end", "out_start", "out_end",
         "in_start_hms", "in_end_hms", "out_start_hms", "out_end_hms",
-        "confidence", "bpm_shift_pct",
+        "confidence",
+        "bpm_shift_pct", "bpm_shift_min_pct", "bpm_shift_max_pct",
+        "bpm_shift_stdev_pct",
+        "original_bpm", "played_bpm_mean",
     ]
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -690,17 +880,36 @@ def write_tracklist(tracks: list, out_path: str):
                 "status": status,
             }
             if status in ("ok", "low_confidence"):
+                if t.segment_ratios is not None and len(t.segment_ratios):
+                    seg_pcts = (t.segment_ratios - 1.0) * 100
+                    seg_min  = f"{seg_pcts.min():+.2f}"
+                    seg_max  = f"{seg_pcts.max():+.2f}"
+                    seg_std  = f"{seg_pcts.std():.2f}"
+                    mean_ratio = float(t.segment_ratios.mean())
+                else:
+                    seg_min = seg_max = seg_std = ""
+                    mean_ratio = t.tempo_ratio
+
+                played_bpm_mean = (
+                    f"{t.bpm * mean_ratio:.2f}" if t.bpm > 0 else ""
+                )
+
                 row.update({
-                    "in_start":      f"{t.in_start_secs:.3f}"  if t.in_start_secs  is not None else "",
-                    "in_end":        f"{t.in_end_secs:.3f}"    if t.in_end_secs    is not None else "",
-                    "out_start":     f"{t.out_start_secs:.3f}" if t.out_start_secs is not None else "",
-                    "out_end":       f"{t.out_end_secs:.3f}"   if t.out_end_secs   is not None else "",
-                    "in_start_hms":  fmt_time(t.in_start_secs),
-                    "in_end_hms":    fmt_time(t.in_end_secs),
-                    "out_start_hms": fmt_time(t.out_start_secs),
-                    "out_end_hms":   fmt_time(t.out_end_secs),
-                    "confidence":    f"{t.confidence:.3f}",
-                    "bpm_shift_pct": f"{(t.tempo_ratio - 1.0) * 100:+.2f}",
+                    "in_start":         f"{t.in_start_secs:.3f}"  if t.in_start_secs  is not None else "",
+                    "in_end":           f"{t.in_end_secs:.3f}"    if t.in_end_secs    is not None else "",
+                    "out_start":        f"{t.out_start_secs:.3f}" if t.out_start_secs is not None else "",
+                    "out_end":          f"{t.out_end_secs:.3f}"   if t.out_end_secs   is not None else "",
+                    "in_start_hms":     fmt_time(t.in_start_secs),
+                    "in_end_hms":       fmt_time(t.in_end_secs),
+                    "out_start_hms":    fmt_time(t.out_start_secs),
+                    "out_end_hms":      fmt_time(t.out_end_secs),
+                    "confidence":       f"{t.confidence:.3f}",
+                    "bpm_shift_pct":    f"{(t.tempo_ratio - 1.0) * 100:+.2f}",
+                    "bpm_shift_min_pct":   seg_min,
+                    "bpm_shift_max_pct":   seg_max,
+                    "bpm_shift_stdev_pct": seg_std,
+                    "original_bpm":     f"{t.bpm:.2f}" if t.bpm > 0 else "",
+                    "played_bpm_mean":  played_bpm_mean,
                 })
             else:
                 for k in fieldnames[4:]:
@@ -740,7 +949,7 @@ def write_heatmap(tracks: list, set_duration: float, out_path: str):
                             left=np.nan, right=np.nan)
 
     fig_height = max(4, 0.32 * len(visible) + 1.5)
-    fig, ax = plt.subplots(figsize=(14, fig_height))
+    fig, ax = plt.subplots(figsize=(42, fig_height))   # 3× the original 14" wide
     im = ax.imshow(
         grid,
         aspect="auto",
@@ -753,22 +962,44 @@ def write_heatmap(tracks: list, set_duration: float, out_path: str):
     )
     fig.colorbar(im, ax=ax, label="per-frame similarity (cosine)")
 
-    # Detected-start markers
+    # Marker set per row:
+    #   in_start  — green ▶ (mix-in begins)            — left edge of in-transition
+    #   in_end    — orange ▶ (previous track gone)     — right edge of in-transition
+    #   out_start — orange ◀ (next track audible)      — left edge of out-transition
+    #   out_end   — red ◀  (this track gone)           — right edge of out-transition
+    # detected_start_secs gets a small ring on top for the global lock.
     for i, t in enumerate(visible):
         if t.detected_start_secs is None:
             continue
-        marker_color = "lime" if t.confidence >= MIN_CONFIDENCE else "red"
-        ax.plot(t.detected_start_secs, i, marker="o",
-                markerfacecolor="none", markeredgecolor=marker_color,
-                markeredgewidth=1.4, markersize=8, zorder=5)
 
-    tick_vals, tick_labels = _hms_ticks(0, set_duration, n_ticks=12)
+        for x_secs_val, color, marker in [
+            (t.in_start_secs,  "lime",       ">"),
+            (t.in_end_secs,    "orange",     ">"),
+            (t.out_start_secs, "darkorange", "<"),
+            (t.out_end_secs,   "red",        "<"),
+        ]:
+            if x_secs_val is None:
+                continue
+            ax.plot(x_secs_val, i, marker=marker, color=color,
+                    markersize=7, zorder=5,
+                    markeredgecolor="black", markeredgewidth=0.4)
+
+        ring_color = "lime" if t.confidence >= MIN_CONFIDENCE else "red"
+        ax.plot(t.detected_start_secs, i, marker="o",
+                markerfacecolor="none", markeredgecolor=ring_color,
+                markeredgewidth=1.4, markersize=10, zorder=4)
+
+    tick_vals, tick_labels = _hms_ticks(0, set_duration, n_ticks=24)
     ax.set_xticks(tick_vals)
     ax.set_xticklabels(tick_labels)
     ax.set_yticks(range(len(visible)))
     ax.set_yticklabels([f"{t.number:>2}  {t.title[:38]}" for t in visible], fontsize=8)
     ax.set_xlabel("Set time (h:mm:ss)" if set_duration >= 3600 else "Set time (m:ss)")
-    ax.set_title("Per-track playback heatmap — green ◯ = locked, red ◯ = low confidence")
+    ax.set_title(
+        "Per-track playback heatmap — "
+        "▶ green/orange = in-transition window, ◀ orange/red = out-transition window, "
+        "◯ green/red = global lock confidence"
+    )
     ax.grid(axis="x", color="white", alpha=0.15, linewidth=0.4)
     fig.tight_layout()
     fig.savefig(out_path, dpi=140)
@@ -815,6 +1046,7 @@ def write_interactive_transitions(tracks: list, set_duration: float, out_path: s
         subplot_titles=titles,
         vertical_spacing=0.04,
         horizontal_spacing=0.06,
+        specs=[[{"secondary_y": True}] * cols for _ in range(rows)],
     )
 
     for i, t in enumerate(visible):
@@ -845,7 +1077,7 @@ def write_interactive_transitions(tracks: list, set_duration: float, out_path: s
                 ),
                 showlegend=False,
             ),
-            row=row, col=col,
+            row=row, col=col, secondary_y=False,
         )
 
         # Previous track (the one ending around this transition)
@@ -869,8 +1101,36 @@ def write_interactive_transitions(tracks: list, set_duration: float, out_path: s
                     ),
                     showlegend=False,
                 ),
-                row=row, col=col,
+                row=row, col=col, secondary_y=False,
             )
+
+        # BPM-shift line — per-segment % deviation from original speed.  Plotted
+        # on a secondary y-axis so it doesn't visually compete with the
+        # similarity curves but is still readable on hover.
+        if t.segment_centers_secs is not None and len(t.segment_centers_secs) > 1:
+            seg_mask = ((t.segment_centers_secs >= x0) &
+                        (t.segment_centers_secs <= x1))
+            if seg_mask.any():
+                seg_x   = t.segment_centers_secs[seg_mask]
+                seg_pct = (t.segment_ratios[seg_mask] - 1.0) * 100.0
+                seg_lbl = [fmt_time_hms(s, with_hours=set_duration >= 3600)
+                           for s in seg_x]
+                fig.add_trace(
+                    go.Scatter(
+                        x=seg_x,
+                        y=seg_pct,
+                        customdata=seg_lbl,
+                        mode="lines+markers",
+                        line=dict(width=1.2, color="#9467bd"),
+                        marker=dict(size=4, color="#9467bd"),
+                        hovertemplate=(
+                            "set time=%{customdata}<br>"
+                            "bpm shift=%{y:+.2f}%<extra></extra>"
+                        ),
+                        showlegend=False,
+                    ),
+                    row=row, col=col, secondary_y=True,
+                )
 
         # Vertical markers — incoming track's transition windows.
         # in_start / in_end mark when the *incoming* track first becomes
@@ -911,12 +1171,23 @@ def write_interactive_transitions(tracks: list, set_duration: float, out_path: s
             ticktext=tick_labels,
             row=row, col=col,
         )
-        fig.update_yaxes(range=[0, 1], row=row, col=col)
+        fig.update_yaxes(
+            title_text="similarity" if col == 1 else "",
+            range=[0, 1],
+            row=row, col=col, secondary_y=False,
+        )
+        fig.update_yaxes(
+            title_text="bpm shift %" if col == cols else "",
+            row=row, col=col, secondary_y=True,
+            showgrid=False,
+            color="#9467bd",
+            tickformat="+.2f",
+        )
 
     fig.update_layout(
         title=("Transition explorer — incoming (blue solid) vs outgoing (orange dotted) "
-               "track similarity. Green dashed = in_start (mix-in begins), "
-               "orange dashed = in_end (previous track gone). "
+               "track similarity. Purple = per-segment BPM shift % (right axis). "
+               "Green dashed = in_start, orange dashed = in_end. "
                "Gray dotted = lock/onset thresholds."),
         height=max(400, rows * 240),
         plot_bgcolor="white",
@@ -927,6 +1198,497 @@ def write_interactive_transitions(tracks: list, set_duration: float, out_path: s
 
     fig.write_html(out_path, include_plotlyjs="cdn")
     print(f"  Transitions   : {out_path}")
+
+
+def _downsample_curve(curve: np.ndarray, times: np.ndarray, target_n: int) -> tuple:
+    """Downsample a (curve, times) pair to ~target_n points for embedding.
+
+    Plain stride sampling — preserves the shape well enough at 1500 points to
+    show transitions clearly without bloating the embedded JSON.
+    """
+    n = len(curve)
+    if n <= target_n:
+        return curve.tolist(), times.tolist()
+    step = max(1, n // target_n)
+    return curve[::step].tolist(), times[::step].tolist()
+
+
+def write_review_ui(tracks: list, set_duration: float, out_path: str):
+    """Write a self-contained HTML page for reviewing the tracklist.
+
+    Two panes side-by-side:
+      • LEFT  — sortable, searchable table of every track from the CSV.
+                Click any row to focus that track in the right pane.
+      • RIGHT — three stacked plotly charts: previous track, current track,
+                next track.  Each shows the per-frame similarity curve
+                centred on the current track's transition zone, with the
+                four transition markers (in_start, in_end, out_start, out_end)
+                drawn as vertical dashed lines and the lock and onset
+                thresholds drawn as horizontal dotted lines.
+
+    Everything is inlined into a single HTML file using plotly.js from a CDN —
+    no server, no extra files; just open it in a browser.
+    """
+    if not _HAS_PLOTLY:
+        # We don't strictly need plotly to write the file (the HTML loads it
+        # from a CDN at view time), but we lean on go.Scatter shapes to keep
+        # this consistent with the other interactive plot.  Skip if missing
+        # so the user still gets a clear install hint.
+        print("  (plotly not installed — skipping review UI. pip install plotly)")
+        return
+
+    detectable = [t for t in tracks
+                  if not t.is_mashup and not t.is_missing
+                  and t.played_curve is not None]
+    if not detectable:
+        print("  (no detectable tracks — skipping review UI)")
+        return
+
+    # Build a lookup so the JS can pull a track's curve by its CSV number.
+    # Curves are stride-downsampled to keep the page light (~50 KB / track
+    # at 1500 points instead of ~1 MB at 100 k frames).
+    curves = {}
+    for t in detectable:
+        y_ds, x_ds = _downsample_curve(t.played_curve, t.played_times_secs, 1500)
+        # Per-segment BPM shift trace (small, no need to downsample)
+        if t.segment_centers_secs is not None and len(t.segment_centers_secs):
+            seg_x = t.segment_centers_secs.tolist()
+            seg_y = ((t.segment_ratios - 1.0) * 100.0).tolist()
+        else:
+            seg_x, seg_y = [], []
+        curves[str(t.number)] = {
+            "x":          x_ds,
+            "y":          y_ds,
+            "seg_x":      seg_x,
+            "seg_y":      seg_y,
+            "in_start":   t.in_start_secs,
+            "in_end":     t.in_end_secs,
+            "out_start":  t.out_start_secs,
+            "out_end":    t.out_end_secs,
+            "lock":       t.detected_start_secs,
+            "confidence": float(t.confidence),
+            "title":      t.title,
+            "artist":     t.artist,
+        }
+
+    # Table rows — same fields the CSV gets, plus a clickable status badge.
+    rows = []
+    for t in tracks:
+        if t.is_mashup:
+            status, status_class = "mashup", "mashup"
+        elif t.is_missing:
+            status, status_class = "missing", "missing"
+        elif t.confidence < MIN_CONFIDENCE:
+            status, status_class = "low_confidence", "low"
+        else:
+            status, status_class = "ok", "ok"
+
+        if status in ("ok", "low_confidence"):
+            seg_std = ""
+            if t.segment_ratios is not None and len(t.segment_ratios):
+                seg_std = f"{((t.segment_ratios - 1.0) * 100).std():.2f}"
+            rows.append({
+                "num":           t.number,
+                "title":         t.title,
+                "artist":        t.artist,
+                "status":        status,
+                "status_class":  status_class,
+                "in_start_hms":  fmt_time(t.in_start_secs),
+                "in_end_hms":    fmt_time(t.in_end_secs),
+                "out_start_hms": fmt_time(t.out_start_secs),
+                "out_end_hms":   fmt_time(t.out_end_secs),
+                "confidence":    f"{t.confidence:.3f}",
+                "bpm_shift":     f"{(t.tempo_ratio - 1.0) * 100:+.2f}",
+                "bpm_stdev":     seg_std,
+                "selectable":    True,
+            })
+        else:
+            rows.append({
+                "num":          t.number,
+                "title":        t.title,
+                "artist":       t.artist,
+                "status":       status,
+                "status_class": status_class,
+                "in_start_hms":  "",
+                "in_end_hms":    "",
+                "out_start_hms": "",
+                "out_end_hms":   "",
+                "confidence":    "",
+                "bpm_shift":     "",
+                "bpm_stdev":     "",
+                "selectable":    False,
+            })
+
+    # Order of detectable tracks (used for prev/next navigation)
+    detectable_nums = [t.number for t in detectable]
+
+    payload = {
+        "set_duration":     set_duration,
+        "min_confidence":   MIN_CONFIDENCE,
+        "played_threshold": PLAYED_THRESHOLD,
+        "onset_threshold":  ONSET_THRESHOLD,
+        "transition_window_secs": TRANSITION_WINDOW_SECS,
+        "rows":             rows,
+        "curves":           curves,
+        "detectable_nums":  detectable_nums,
+    }
+
+    html = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Tracklist review</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  :root {
+    --bg: #1a1a1a; --panel: #232323; --border: #333; --text: #e0e0e0;
+    --muted: #888; --accent: #4a9eff;
+    --ok: #4ade80; --low: #fbbf24; --mashup: #818cf8; --missing: #f87171;
+  }
+  body { margin:0; padding:0; background:var(--bg); color:var(--text);
+         font:13px/1.4 -apple-system, BlinkMacSystemFont, sans-serif; }
+  #app { display:grid; grid-template-columns: 580px 1fr; height:100vh; }
+  #left { border-right:1px solid var(--border); overflow:hidden;
+          display:flex; flex-direction:column; }
+  #search { padding:10px; border-bottom:1px solid var(--border);
+            background:var(--panel); }
+  #search input { width:100%; box-sizing:border-box; padding:6px 8px;
+                  background:#0f0f0f; color:var(--text);
+                  border:1px solid var(--border); border-radius:4px; }
+  #table-wrap { flex:1; overflow:auto; }
+  table { border-collapse:collapse; width:100%; }
+  thead th { position:sticky; top:0; background:var(--panel);
+             text-align:left; padding:6px 8px; font-weight:500;
+             border-bottom:1px solid var(--border); cursor:pointer;
+             user-select:none; }
+  thead th:hover { color:var(--accent); }
+  tbody tr { border-bottom:1px solid #2a2a2a; cursor:pointer; }
+  tbody tr.selectable:hover { background:#2a2a2a; }
+  tbody tr.selected { background:#1e3a5f !important; }
+  tbody tr.unselectable { color:var(--muted); cursor:default; }
+  td { padding:5px 8px; vertical-align:top; }
+  td.num { color:var(--muted); width:28px; text-align:right; }
+  td.title { max-width:200px; overflow:hidden; text-overflow:ellipsis;
+             white-space:nowrap; }
+  td.artist { color:var(--muted); max-width:140px; overflow:hidden;
+              text-overflow:ellipsis; white-space:nowrap; }
+  td.mono { font-family:ui-monospace, monospace; font-size:12px;
+            color:#bbb; }
+  .badge { display:inline-block; padding:1px 6px; border-radius:3px;
+           font-size:10px; text-transform:uppercase; font-weight:600; }
+  .badge.ok      { background:rgba(74, 222, 128, 0.18); color:var(--ok); }
+  .badge.low     { background:rgba(251, 191, 36, 0.18); color:var(--low); }
+  .badge.mashup  { background:rgba(129, 140, 248, 0.18); color:var(--mashup); }
+  .badge.missing { background:rgba(248, 113, 113, 0.18); color:var(--missing); }
+
+  #right { display:flex; flex-direction:column; overflow:hidden; }
+  #header { padding:10px 16px; border-bottom:1px solid var(--border);
+            background:var(--panel); }
+  #header h2 { margin:0 0 4px 0; font-size:16px; }
+  #header .meta { color:var(--muted); font-size:12px; }
+  #charts { flex:1; overflow:auto; padding:6px; }
+  .chart { height:240px; margin-bottom:6px;
+           border:1px solid var(--border); border-radius:4px;
+           background:#181818; }
+  .chart-label { font-size:11px; color:var(--muted); padding:4px 10px 0; }
+  #empty { padding:40px; color:var(--muted); text-align:center; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="left">
+    <div id="search">
+      <input type="text" id="filter" placeholder="filter by title, artist, # or status…">
+    </div>
+    <div id="table-wrap">
+      <table>
+        <thead><tr>
+          <th data-sort="num">#</th>
+          <th data-sort="title">title</th>
+          <th data-sort="artist">artist</th>
+          <th data-sort="status">status</th>
+          <th data-sort="in_start_hms">in_start</th>
+          <th data-sort="in_end_hms">in_end</th>
+          <th data-sort="out_start_hms">out_start</th>
+          <th data-sort="out_end_hms">out_end</th>
+          <th data-sort="confidence">conf</th>
+          <th data-sort="bpm_shift">bpm%</th>
+          <th data-sort="bpm_stdev">σ%</th>
+        </tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+  </div>
+  <div id="right">
+    <div id="header">
+      <h2 id="track-title">— select a track —</h2>
+      <div class="meta" id="track-meta"></div>
+    </div>
+    <div id="charts">
+      <div id="empty">Click a row in the table to inspect that track's transition zone.<br>
+        The three charts will show the previous, current, and next song's similarity curve
+        with markers for in_start, in_end, out_start, and out_end.</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const DATA = __PAYLOAD__;
+
+function fmtTime(secs) {
+  if (secs == null || isNaN(secs)) return '?';
+  secs = Math.max(0, secs);
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor(secs / 60) % 60;
+  const s = secs - 60 * (60 * h + m);
+  if (h > 0) return `${h}:${String(m).padStart(2,'0')}:${s.toFixed(2).padStart(5,'0')}`;
+  return `${m}:${s.toFixed(2).padStart(5,'0')}`;
+}
+
+function fmtTickHms(secs, withHours) {
+  secs = Math.max(0, secs);
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor(secs / 60) % 60;
+  const s = Math.round(secs) % 60;
+  if (withHours || h > 0) return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  return `${m}:${String(s).padStart(2,'0')}`;
+}
+
+function hmsTicks(x0, x1, n) {
+  const span = Math.max(0.001, x1 - x0);
+  const target = span / Math.max(1, n);
+  const candidates = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200];
+  const step = candidates.find(c => c >= target) ?? candidates[candidates.length - 1];
+  const first = Math.ceil(x0 / step) * step;
+  const vals = [];
+  for (let v = first; v <= x1 + step / 2; v += step) vals.push(v);
+  const useH = x1 >= 3600;
+  return [vals, vals.map(v => fmtTickHms(v, useH))];
+}
+
+// ── Table render + filter + sort ────────────────────────────────────────
+let sortKey = 'num';
+let sortDir = 1;
+let filterText = '';
+
+function renderTable() {
+  const tbody = document.getElementById('tbody');
+  const q = filterText.toLowerCase();
+  const rows = DATA.rows.filter(r => {
+    if (!q) return true;
+    return [r.num, r.title, r.artist, r.status]
+      .some(v => String(v).toLowerCase().includes(q));
+  });
+  rows.sort((a, b) => {
+    let av = a[sortKey], bv = b[sortKey];
+    const an = parseFloat(av), bn = parseFloat(bv);
+    if (!isNaN(an) && !isNaN(bn)) { av = an; bv = bn; }
+    if (av < bv) return -sortDir;
+    if (av > bv) return  sortDir;
+    return 0;
+  });
+  tbody.innerHTML = rows.map(r => `
+    <tr class="${r.selectable ? 'selectable' : 'unselectable'}" data-num="${r.num}">
+      <td class="num">${r.num}</td>
+      <td class="title" title="${r.title.replace(/"/g,'&quot;')}">${r.title}</td>
+      <td class="artist" title="${r.artist.replace(/"/g,'&quot;')}">${r.artist}</td>
+      <td><span class="badge ${r.status_class}">${r.status}</span></td>
+      <td class="mono">${r.in_start_hms}</td>
+      <td class="mono">${r.in_end_hms}</td>
+      <td class="mono">${r.out_start_hms}</td>
+      <td class="mono">${r.out_end_hms}</td>
+      <td class="mono">${r.confidence}</td>
+      <td class="mono">${r.bpm_shift}</td>
+      <td class="mono">${r.bpm_stdev}</td>
+    </tr>`).join('');
+
+  document.querySelectorAll('tbody tr.selectable').forEach(tr => {
+    tr.addEventListener('click', () => selectTrack(parseInt(tr.dataset.num, 10)));
+  });
+}
+
+document.querySelectorAll('th[data-sort]').forEach(th => {
+  th.addEventListener('click', () => {
+    const k = th.dataset.sort;
+    if (sortKey === k) sortDir = -sortDir; else { sortKey = k; sortDir = 1; }
+    renderTable();
+  });
+});
+document.getElementById('filter').addEventListener('input', e => {
+  filterText = e.target.value;
+  renderTable();
+});
+
+// ── Right pane: three charts (prev / current / next) ────────────────────
+function buildChart(divId, label, curveData, windowCenter, windowSecs, role) {
+  if (!curveData) {
+    document.getElementById(divId).innerHTML =
+      `<div class='chart-label'>${label}: (none)</div>`;
+    return;
+  }
+  const x0 = Math.max(0, windowCenter - windowSecs);
+  const x1 = Math.min(DATA.set_duration, windowCenter + windowSecs);
+
+  // Slice curve to window for performance
+  const xAll = curveData.x, yAll = curveData.y;
+  const xs = [], ys = [];
+  for (let i = 0; i < xAll.length; i++) {
+    if (xAll[i] >= x0 && xAll[i] <= x1) { xs.push(xAll[i]); ys.push(yAll[i]); }
+  }
+  const customLabels = xs.map(s => fmtTickHms(s, DATA.set_duration >= 3600));
+
+  const colorByRole = { prev: '#ff7f0e', current: '#1f77b4', next: '#2ca02c' };
+  const dashByRole  = { prev: 'dot',     current: 'solid',  next: 'dash' };
+  const lineColor = colorByRole[role] || '#1f77b4';
+
+  const traces = [{
+    x: xs, y: ys, customdata: customLabels,
+    mode: 'lines',
+    line: { color: lineColor, width: 2, dash: dashByRole[role] || 'solid' },
+    hovertemplate:
+      'set time=%{customdata}<br>' +
+      'similarity=%{y:.3f}<extra></extra>',
+    name: label,
+  }];
+
+  // Per-segment BPM-shift line on secondary y-axis
+  if (curveData.seg_x && curveData.seg_x.length) {
+    const sx = [], sy = [];
+    for (let i = 0; i < curveData.seg_x.length; i++) {
+      if (curveData.seg_x[i] >= x0 && curveData.seg_x[i] <= x1) {
+        sx.push(curveData.seg_x[i]); sy.push(curveData.seg_y[i]);
+      }
+    }
+    if (sx.length) {
+      traces.push({
+        x: sx, y: sy,
+        customdata: sx.map(s => fmtTickHms(s, DATA.set_duration >= 3600)),
+        mode: 'lines+markers', yaxis: 'y2',
+        line: { color: '#9467bd', width: 1.2 },
+        marker: { size: 4, color: '#9467bd' },
+        hovertemplate:
+          'set time=%{customdata}<br>bpm shift=%{y:+.2f}%<extra></extra>',
+        showlegend: false,
+      });
+    }
+  }
+
+  const shapes = [];
+  // Markers: in_start / in_end / out_start / out_end + lock
+  const markerSpecs = [
+    { val: curveData.in_start,  color: '#4ade80', label: 'in_start' },
+    { val: curveData.in_end,    color: '#fbbf24', label: 'in_end' },
+    { val: curveData.out_start, color: '#fb923c', label: 'out_start' },
+    { val: curveData.out_end,   color: '#f87171', label: 'out_end' },
+  ];
+  markerSpecs.forEach(m => {
+    if (m.val == null || m.val < x0 || m.val > x1) return;
+    shapes.push({
+      type: 'line', x0: m.val, x1: m.val, y0: 0, y1: 1, yref: 'y',
+      line: { color: m.color, width: 1.5, dash: 'dash' },
+    });
+  });
+  // Lock-confidence ring (thin solid line)
+  if (curveData.lock != null && curveData.lock >= x0 && curveData.lock <= x1) {
+    const lockColor = curveData.confidence >= DATA.min_confidence ? '#4ade80' : '#f87171';
+    shapes.push({
+      type: 'line', x0: curveData.lock, x1: curveData.lock, y0: 0, y1: 1, yref: 'y',
+      line: { color: lockColor, width: 1, dash: 'solid' },
+    });
+  }
+  // Threshold lines
+  shapes.push({
+    type: 'line', x0: x0, x1: x1, y0: DATA.played_threshold, y1: DATA.played_threshold,
+    line: { color: '#666', width: 1, dash: 'dot' },
+  });
+  shapes.push({
+    type: 'line', x0: x0, x1: x1, y0: DATA.onset_threshold, y1: DATA.onset_threshold,
+    line: { color: '#444', width: 1, dash: 'dot' },
+  });
+
+  const [tickVals, tickLabels] = hmsTicks(x0, x1, 8);
+
+  const layout = {
+    title: { text: label, font: { size: 12, color: '#bbb' }, x: 0.01, y: 0.98 },
+    xaxis: {
+      range: [x0, x1], tickmode: 'array', tickvals: tickVals, ticktext: tickLabels,
+      gridcolor: '#2a2a2a', color: '#aaa',
+    },
+    yaxis: {
+      range: [0, 1], gridcolor: '#2a2a2a', color: '#aaa',
+      title: { text: 'similarity', font: { size: 10, color: '#aaa' } },
+    },
+    yaxis2: {
+      overlaying: 'y', side: 'right', showgrid: false,
+      color: '#9467bd', tickformat: '+.2f',
+      title: { text: 'bpm %', font: { size: 10, color: '#9467bd' } },
+    },
+    shapes: shapes,
+    margin: { l: 50, r: 55, t: 24, b: 28 },
+    paper_bgcolor: '#181818', plot_bgcolor: '#181818',
+    font: { color: '#bbb' },
+    showlegend: false,
+  };
+  Plotly.react(divId, traces, layout, { responsive: true, displaylogo: false });
+}
+
+function selectTrack(num) {
+  document.querySelectorAll('tbody tr').forEach(tr => tr.classList.remove('selected'));
+  document.querySelectorAll(`tbody tr[data-num="${num}"]`).forEach(tr =>
+    tr.classList.add('selected'));
+
+  const cur = DATA.curves[String(num)];
+  if (!cur) return;
+  const idx = DATA.detectable_nums.indexOf(num);
+  const prevNum = idx > 0 ? DATA.detectable_nums[idx - 1] : null;
+  const nextNum = idx < DATA.detectable_nums.length - 1 ? DATA.detectable_nums[idx + 1] : null;
+  const prev = prevNum != null ? DATA.curves[String(prevNum)] : null;
+  const next = nextNum != null ? DATA.curves[String(nextNum)] : null;
+
+  // Show transition window: from in_start - W to out_end + W (covers both ends)
+  const w = DATA.transition_window_secs;
+  const center = cur.lock ?? cur.in_start ?? 0;
+
+  document.getElementById('track-title').textContent =
+    `#${num}  ${cur.title} — ${cur.artist}`;
+  const conf = cur.confidence != null ? cur.confidence.toFixed(3) : '—';
+  document.getElementById('track-meta').innerHTML =
+    `lock @ ${fmtTime(cur.lock)} · conf ${conf} · ` +
+    `in [${fmtTime(cur.in_start)} → ${fmtTime(cur.in_end)}] · ` +
+    `out [${fmtTime(cur.out_start)} → ${fmtTime(cur.out_end)}]`;
+
+  const charts = document.getElementById('charts');
+  charts.innerHTML = `
+    <div class="chart" id="chart-prev"></div>
+    <div class="chart" id="chart-cur"></div>
+    <div class="chart" id="chart-next"></div>`;
+
+  // Prev track is shown around the CURRENT track's in_start (the prev's out)
+  const prevCenter = cur.in_start ?? center;
+  buildChart('chart-prev',
+    prev ? `← previous: #${prevNum} ${prev.title}` : '← previous: —',
+    prev, prevCenter, w, 'prev');
+  buildChart('chart-cur',
+    `■ current: #${num} ${cur.title}`,
+    cur, center, w, 'current');
+  // Next track is shown around the CURRENT track's out_start (the next's in)
+  const nextCenter = cur.out_start ?? center;
+  buildChart('chart-next',
+    next ? `→ next: #${nextNum} ${next.title}` : '→ next: —',
+    next, nextCenter, w, 'next');
+}
+
+// Initial render — table populated, no track selected
+renderTable();
+// Auto-select the first detectable track for convenience
+if (DATA.detectable_nums.length) selectTrack(DATA.detectable_nums[0]);
+</script>
+</body>
+</html>"""
+    html = html.replace("__PAYLOAD__", json.dumps(payload))
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"  Review UI     : {out_path}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1003,11 +1765,10 @@ def main():
         ref_chroma_orig = compute_chroma(ref_audio, sr=ANALYSIS_SR, hop=HOP_LENGTH)
         del ref_audio
 
-        # Search across tempo ratios
+        # Search across tempo ratios — coarse sweep then fine refinement.
         max_pct = TEMPO_OVERRIDES.get(t.number, DEFAULT_TEMPO_PCT)
-        ratios  = build_tempo_ratios(max_pct)
-        best    = search_with_tempo_ratios(
-            set_chroma, ref_chroma_orig, ratios, s0_frame, s1_frame
+        best = search_tempo_two_stage(
+            set_chroma, ref_chroma_orig, max_pct, s0_frame, s1_frame
         )
 
         # Retry with wide range if confidence too low
@@ -1016,9 +1777,8 @@ def main():
             prev_conf = f"{best['confidence']:.2f}" if best else "n/a"
             print(f"  Low confidence ({prev_conf}), "
                   f"retrying with ±{WIDE_TEMPO_PCT}% tempo …")
-            ratios = build_tempo_ratios(WIDE_TEMPO_PCT)
-            best   = search_with_tempo_ratios(
-                set_chroma, ref_chroma_orig, ratios, s0_frame, s1_frame
+            best = search_tempo_two_stage(
+                set_chroma, ref_chroma_orig, WIDE_TEMPO_PCT, s0_frame, s1_frame
             )
 
         if best is None:
@@ -1027,6 +1787,18 @@ def main():
 
         # Refine to audible region (ignore intro silence / pre-hotcue audio)
         ref_chroma_at_best = warp_chroma(ref_chroma_orig, best["ratio"])
+
+        # Per-segment ratio refinement — captures slow speed changes within a
+        # track so the played-curve stays sharp through long mixes.
+        if SEGMENT_REFINE_ENABLED:
+            seg_centers, seg_ratios, ref_chroma_at_best = refine_tempo_per_segment(
+                set_chroma, ref_chroma_orig,
+                global_offset=best["offset"],
+                global_ratio=best["ratio"],
+                frames_per_sec=frames_per_sec,
+            )
+            t.segment_centers_secs = seg_centers
+            t.segment_ratios       = seg_ratios
 
         # Per-frame similarity at the locked alignment — high during playback,
         # low otherwise.  This is what gives the heatmap real contrast.
@@ -1049,9 +1821,17 @@ def main():
 
         bpm_shift = (best["ratio"] - 1.0) * 100
         flag      = "✓" if t.confidence >= MIN_CONFIDENCE else "?"
+        if t.segment_ratios is not None and len(t.segment_ratios) > 1:
+            seg_pcts = (t.segment_ratios - 1.0) * 100
+            seg_info = (f"   seg_shift=[{seg_pcts.min():+.2f}%, "
+                        f"{seg_pcts.max():+.2f}%] "
+                        f"σ={seg_pcts.std():.2f}%")
+        else:
+            seg_info = ""
         print(f"  {flag} Start: {fmt_time(t.detected_start_secs)}   "
               f"End: {fmt_time(t.detected_end_secs)}   "
-              f"conf={t.confidence:.3f}   bpm_shift={bpm_shift:+.1f}%")
+              f"conf={t.confidence:.3f}   "
+              f"bpm_shift={bpm_shift:+.2f}%{seg_info}")
 
         last_start_secs = t.detected_start_secs
 
@@ -1064,6 +1844,7 @@ def main():
     write_tracklist(tracks, OUTPUT_TRACKLIST)
     write_heatmap(tracks, set_duration, OUTPUT_HEATMAP)
     write_interactive_transitions(tracks, set_duration, OUTPUT_INTERACTIVE)
+    write_review_ui(tracks, set_duration, OUTPUT_REVIEW_UI)
 
 
 if __name__ == "__main__":
