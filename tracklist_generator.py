@@ -312,24 +312,24 @@ def _parse_hotcue_blob(blob: bytes) -> dict:
 def _track_id_for_path(db_path: str, file_path: str) -> Optional[int]:
     """Look up the Engine DJ track ID for a given file path.
 
-    Tries the exact path first, then falls back to matching just the filename.
+    Engine DJ stores only the bare filename (no directory) in the filename
+    column. Try an exact basename match first, then fall back to a LIKE search
+    in case the stored name differs slightly.
     """
     if not os.path.isfile(db_path):
         return None
     try:
         con = sqlite3.connect(db_path)
         cur = con.cursor()
-        # Normalise separators for the comparison
-        norm = file_path.replace("\\", "/")
-        cur.execute("SELECT id FROM Track WHERE filename = ?", (norm,))
+        basename = os.path.basename(file_path)
+        cur.execute("SELECT id FROM Track WHERE filename = ?", (basename,))
         row = cur.fetchone()
         if row:
             con.close()
             return int(row[0])
-        # Fall back: match by the last path component (filename only)
-        basename = os.path.basename(norm)
+        # Fall back: partial match (handles minor name differences)
         cur.execute("SELECT id FROM Track WHERE filename LIKE ?",
-                    (f"%/{basename}",))
+                    (f"%{basename}%",))
         row = cur.fetchone()
         con.close()
         return int(row[0]) if row else None
