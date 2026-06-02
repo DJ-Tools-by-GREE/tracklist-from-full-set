@@ -1817,7 +1817,7 @@ def write_review_ui(tracks: list, set_duration: float, out_path: str):
         def _to_set(cue):
             if cue is None or t.detected_start_secs is None:
                 return None
-            return t.detected_start_secs + cue / mean_ratio
+            return float(t.detected_start_secs + cue / mean_ratio)
         curves[str(t.number)] = {
             "x":          x_ds,
             "y":          y_ds,
@@ -1862,7 +1862,7 @@ def write_review_ui(tracks: list, set_duration: float, out_path: str):
             def _to_set_r(cue):
                 if cue is None or t.detected_start_secs is None:
                     return None
-                return t.detected_start_secs + cue / mean_ratio
+                return float(t.detected_start_secs + cue / mean_ratio)
 
             cue1_set = _to_set_r(t.cue1_secs)
             cue3_set = _to_set_r(t.cue3_secs)
@@ -1872,7 +1872,7 @@ def write_review_ui(tracks: list, set_duration: float, out_path: str):
             def _aligned(cue_set, marker_secs):
                 if cue_set is None or marker_secs is None:
                     return None
-                return abs(cue_set - marker_secs) <= CUE_ALIGN_THRESHOLD_SECS
+                return bool(abs(cue_set - marker_secs) <= CUE_ALIGN_THRESHOLD_SECS)
 
             rows.append({
                 "num":           t.number,
